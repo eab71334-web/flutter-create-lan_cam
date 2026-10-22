@@ -18,9 +18,33 @@ const Map<String, dynamic> kPcConfig = {
 
 const MethodChannel _svc = MethodChannel('lancam/service');
 
-void main() => runApp(const MaterialApp(
+// ── design tokens ──
+const Color kBg = Color(0xFF0B1220);
+const Color kSurface = Color(0xFF111B2E);
+const Color kSurface2 = Color(0xFF1B2A44);
+const Color kAccent = Color(0xFF22D3EE);
+const Color kRed = Color(0xFFEF4444);
+const Color kGreen = Color(0xFF22C55E);
+
+void main() => runApp(MaterialApp(
       debugShowCheckedModeBanner: false,
-      home: Home(),
+      title: 'LAN Cam',
+      theme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        colorScheme:
+            ColorScheme.fromSeed(seedColor: kAccent, brightness: Brightness.dark),
+        scaffoldBackgroundColor: kBg,
+        appBarTheme: const AppBarTheme(
+          backgroundColor: kBg,
+          elevation: 0,
+          centerTitle: true,
+          scrolledUnderElevation: 0,
+        ),
+      ),
+      builder: (context, child) =>
+          Directionality(textDirection: TextDirection.rtl, child: child!),
+      home: const Home(),
     ));
 
 // ───────────────────────────── Helpers ─────────────────────────────
@@ -125,6 +149,184 @@ Future<void> waitIceGathered(RTCPeerConnection pc) async {
 }
 
 // ───────────────────────────── Widgets ─────────────────────────────
+class LogoPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final s = size.width;
+    final rect = Offset.zero & size;
+    canvas.save();
+    canvas.clipRRect(RRect.fromRectAndRadius(rect, Radius.circular(s * 0.225)));
+    canvas.drawRect(
+        rect,
+        Paint()
+          ..shader = const LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF0B1220), Color(0xFF12304A)],
+          ).createShader(rect));
+    final c = Offset(s * 0.46, s * 0.56);
+    canvas.drawCircle(
+        c,
+        s * 0.6,
+        Paint()
+          ..shader = const RadialGradient(
+            colors: [Color(0x4722D3EE), Color(0x0022D3EE)],
+          ).createShader(Rect.fromCircle(center: c, radius: s * 0.6)));
+    canvas.drawCircle(
+        c,
+        s * 0.225,
+        Paint()
+          ..shader = const LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF22D3EE), Color(0xFF2563EB)],
+          ).createShader(Rect.fromCircle(center: c, radius: s * 0.225)));
+    canvas.drawCircle(c, s * 0.185, Paint()..color = const Color(0xFF0A1628));
+    canvas.drawCircle(
+        c,
+        s * 0.15,
+        Paint()
+          ..shader = const RadialGradient(
+            center: Alignment(-0.3, -0.3),
+            colors: [Color(0xFF3B82F6), Color(0xFF0B1B3A)],
+          ).createShader(Rect.fromCircle(center: c, radius: s * 0.15)));
+    canvas.drawCircle(c, s * 0.068, Paint()..color = const Color(0xFF050B18));
+    canvas.drawCircle(c.translate(-s * 0.05, -s * 0.055), s * 0.03,
+        Paint()..color = const Color(0x99FFFFFF));
+    canvas.restore();
+
+    const colors = [Color(0xFF22D3EE), Color(0xBF22D3EE), Color(0x8022D3EE)];
+    const radii = [0.30, 0.36, 0.42];
+    for (var i = 0; i < 3; i++) {
+      canvas.drawArc(
+          Rect.fromCircle(center: c, radius: s * radii[i]),
+          -70 * pi / 180,
+          50 * pi / 180,
+          false,
+          Paint()
+            ..color = colors[i]
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = s * 0.026
+            ..strokeCap = StrokeCap.round);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+class LogoMark extends StatelessWidget {
+  const LogoMark({super.key, this.size = 96});
+  final double size;
+  @override
+  Widget build(BuildContext context) => Container(
+        width: size,
+        height: size,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(size * 0.225),
+          boxShadow: const [BoxShadow(color: Color(0x3322D3EE), blurRadius: 36)],
+        ),
+        child: CustomPaint(painter: LogoPainter()),
+      );
+}
+
+class Pill extends StatelessWidget {
+  const Pill({super.key, required this.color, required this.text});
+  final Color color;
+  final String text;
+  @override
+  Widget build(BuildContext context) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+          color: const Color(0x99000000),
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: 8,
+            height: 8,
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 6),
+          Text(text,
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.8)),
+        ]),
+      );
+}
+
+class RoundIcon extends StatelessWidget {
+  const RoundIcon({super.key, required this.icon, required this.onTap});
+  final IconData icon;
+  final VoidCallback onTap;
+  @override
+  Widget build(BuildContext context) => Material(
+        color: const Color(0x99000000),
+        shape: const CircleBorder(),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.all(8),
+            child: Icon(icon, color: Colors.white, size: 20),
+          ),
+        ),
+      );
+}
+
+class InfoRow extends StatelessWidget {
+  const InfoRow({
+    super.key,
+    required this.label,
+    required this.value,
+    this.big = false,
+    this.trailing,
+  });
+  final String label;
+  final String value;
+  final bool big;
+  final Widget? trailing;
+
+  @override
+  Widget build(BuildContext context) => Container(
+        padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+        decoration: BoxDecoration(
+          color: kBg,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Row(children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(label,
+                  style: const TextStyle(fontSize: 11, color: Colors.white54)),
+              const SizedBox(height: 2),
+              Directionality(
+                textDirection: TextDirection.ltr,
+                child: SelectableText(value,
+                    style: TextStyle(
+                        fontSize: big ? 26 : 16,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: big ? 4 : 0.5)),
+              ),
+            ]),
+          ),
+          if (trailing != null) trailing!,
+          IconButton(
+            icon: const Icon(Icons.copy_rounded, size: 18),
+            color: Colors.white54,
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: value));
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                  content: Text('تم النسخ'), duration: Duration(seconds: 1)));
+            },
+          ),
+        ]),
+      );
+}
+
 class CtlButton extends StatelessWidget {
   const CtlButton({
     super.key,
@@ -141,22 +343,29 @@ class CtlButton extends StatelessWidget {
   final bool dark;
 
   @override
-  Widget build(BuildContext context) => Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          IconButton.filled(
-            onPressed: onTap,
-            icon: Icon(icon),
-            style: IconButton.styleFrom(
-              backgroundColor:
-                  active ? Colors.redAccent : (dark ? Colors.white24 : null),
-              foregroundColor: (active || dark) ? Colors.white : null,
-            ),
+  Widget build(BuildContext context) {
+    final bg = active
+        ? kRed
+        : (dark ? const Color(0x33FFFFFF) : kSurface2);
+    return Column(mainAxisSize: MainAxisSize.min, children: [
+      Material(
+        color: bg,
+        shape: const CircleBorder(),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: onTap,
+          child: SizedBox(
+            width: 50,
+            height: 50,
+            child: Icon(icon, color: Colors.white, size: 24),
           ),
-          Text(label,
-              style: TextStyle(fontSize: 11, color: dark ? Colors.white : null)),
-        ],
-      );
+        ),
+      ),
+      const SizedBox(height: 4),
+      Text(label,
+          style: const TextStyle(fontSize: 11, color: Colors.white70)),
+    ]);
+  }
 }
 
 /// In-app numeric keypad WITH a dot key (works on every phone/locale).
@@ -168,48 +377,185 @@ class Keypad extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '0', '⌫'];
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-      child: GridView.count(
-        crossAxisCount: 3,
-        shrinkWrap: true,
-        physics: const NeverScrollableScrollPhysics(),
-        childAspectRatio: 2.4,
-        mainAxisSpacing: 8,
-        crossAxisSpacing: 8,
-        children: [
-          for (final k in keys)
-            FilledButton.tonal(
-              onPressed: () => k == '⌫' ? onBack() : onKey(k),
-              child: Text(k, style: const TextStyle(fontSize: 24)),
-            ),
-        ],
+    return Directionality(
+      textDirection: TextDirection.ltr,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 4, 14, 10),
+        child: GridView.count(
+          crossAxisCount: 3,
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          childAspectRatio: 2.6,
+          mainAxisSpacing: 8,
+          crossAxisSpacing: 8,
+          children: [
+            for (final k in keys)
+              Material(
+                color: kSurface2,
+                borderRadius: BorderRadius.circular(14),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(14),
+                  onTap: () => k == '⌫' ? onBack() : onKey(k),
+                  child: Center(
+                    child: k == '⌫'
+                        ? const Icon(Icons.backspace_outlined,
+                            color: Colors.white70)
+                        : Text(k,
+                            style: const TextStyle(
+                                fontSize: 24, fontWeight: FontWeight.w600)),
+                  ),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
 }
 
+class ModeCard extends StatelessWidget {
+  const ModeCard({
+    super.key,
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.color,
+    required this.tint,
+    required this.onTap,
+  });
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final Color color;
+  final Color tint;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(22),
+          onTap: onTap,
+          child: Ink(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: kSurface,
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(color: Colors.white10),
+            ),
+            child: Row(children: [
+              Container(
+                width: 56,
+                height: 56,
+                decoration: BoxDecoration(
+                  color: tint,
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Icon(icon, color: color, size: 30),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(title,
+                          style: const TextStyle(
+                              fontSize: 17, fontWeight: FontWeight.w700)),
+                      const SizedBox(height: 3),
+                      Text(subtitle,
+                          style: const TextStyle(
+                              fontSize: 13, color: Colors.white60)),
+                    ]),
+              ),
+              const Icon(Icons.chevron_left_rounded,
+                  color: Colors.white38, size: 28),
+            ]),
+          ),
+        ),
+      );
+}
+
 class Home extends StatelessWidget {
   const Home({super.key});
+
   @override
   Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(title: const Text('LAN Cam')),
-        body: Center(
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            FilledButton.icon(
-              icon: const Icon(Icons.videocam),
-              label: const Text('كاميرا (بث)'),
-              onPressed: () => Navigator.push(context,
-                  MaterialPageRoute(builder: (_) => const CameraPage())),
+        body: Container(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [Color(0xFF0F2038), kBg],
             ),
-            const SizedBox(height: 16),
-            FilledButton.tonalIcon(
-              icon: const Icon(Icons.monitor),
-              label: const Text('مشاهدة'),
-              onPressed: () => Navigator.push(context,
-                  MaterialPageRoute(builder: (_) => const ViewerPage())),
+          ),
+          child: SafeArea(
+            child: Center(
+              child: SingleChildScrollView(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 22, vertical: 24),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 520),
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    const LogoMark(size: 116),
+                    const SizedBox(height: 20),
+                    const Text('LAN Cam',
+                        style: TextStyle(
+                            fontSize: 32,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 1.5)),
+                    const SizedBox(height: 6),
+                    const Text('مراقبة خاصة عبر شبكتك المحلية',
+                        style: TextStyle(color: Colors.white60, fontSize: 15)),
+                    const SizedBox(height: 34),
+                    ModeCard(
+                      icon: Icons.videocam_rounded,
+                      title: 'وضع الكاميرا',
+                      subtitle: 'حوّل هذا الهاتف إلى كاميرا مراقبة',
+                      color: kAccent,
+                      tint: const Color(0x2622D3EE),
+                      onTap: () => Navigator.push(context,
+                          MaterialPageRoute(builder: (_) => const CameraPage())),
+                    ),
+                    const SizedBox(height: 14),
+                    ModeCard(
+                      icon: Icons.visibility_rounded,
+                      title: 'وضع المشاهدة',
+                      subtitle: 'شاهد البث واتحكم بالكاميرا عن بعد',
+                      color: const Color(0xFFA78BFA),
+                      tint: const Color(0x26A78BFA),
+                      onTap: () => Navigator.push(context,
+                          MaterialPageRoute(builder: (_) => const ViewerPage())),
+                    ),
+                    const SizedBox(height: 28),
+                    Wrap(
+                      alignment: WrapAlignment.center,
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final f in const [
+                          'بث مباشر',
+                          'صوت ثنائي الاتجاه',
+                          'تسجيل',
+                          'رمز حماية PIN',
+                        ])
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 12, vertical: 6),
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(20),
+                              border: Border.all(color: Colors.white12),
+                            ),
+                            child: Text(f,
+                                style: const TextStyle(
+                                    fontSize: 12, color: Colors.white60)),
+                          ),
+                      ],
+                    ),
+                  ]),
+                ),
+              ),
             ),
-          ]),
+          ),
         ),
       );
 }
@@ -397,62 +743,125 @@ class _CameraPageState extends State<CameraPage> {
     super.dispose();
   }
 
-  @override
-  Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(title: const Text('وضع الكاميرا'), toolbarHeight: 44),
-        body: SafeArea(
-          child: Row(children: [
-            Expanded(child: RTCVideoView(_local)),
-            SizedBox(
-              width: 250,
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  children: [
-                    SelectableText('$_ip:$kPort',
-                        style: const TextStyle(fontSize: 20)),
-                    const SizedBox(height: 8),
-                    const Text('رمز الدخول (PIN)'),
-                    Text(_pin,
-                        style: const TextStyle(
-                            fontSize: 30,
-                            fontWeight: FontWeight.bold,
-                            letterSpacing: 4)),
-                    TextButton.icon(
-                      icon: const Icon(Icons.refresh, size: 18),
-                      label: const Text('رمز جديد'),
-                      onPressed: () {
-                        setState(() => _pin = _newPin());
-                        saveSettings({'campin': _pin});
-                      },
-                    ),
-                    Text('الحالة: $_status'),
-                    const SizedBox(height: 8),
-                    if (Platform.isAndroid)
-                      FilledButton.icon(
-                        icon: Icon(_recording
-                            ? Icons.stop
-                            : Icons.fiber_manual_record),
-                        label: Text(_recording ? 'إيقاف التسجيل' : 'تسجيل'),
-                        onPressed: () async {
-                          await _toggleRec();
-                          _sendRec();
-                        },
-                      )
-                    else
-                      const Text('التسجيل متاح على Android فقط',
-                          textAlign: TextAlign.center),
-                    if (Platform.isAndroid)
-                      TextButton.icon(
-                        icon: const Icon(Icons.battery_saver, size: 18),
-                        label: const Text('السماح بالعمل بالخلفية'),
-                        onPressed: () => _svc.invokeMethod('battery'),
-                      ),
-                  ],
-                ),
+  bool get _live => _status == 'Connected';
+
+  Widget _panel() => Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: kSurface,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: Colors.white10),
+        ),
+        child: SingleChildScrollView(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Row(children: const [
+              LogoMark(size: 30),
+              SizedBox(width: 8),
+              Text('LAN Cam',
+                  style: TextStyle(
+                      fontWeight: FontWeight.w800,
+                      fontSize: 16,
+                      letterSpacing: 1)),
+            ]),
+            const SizedBox(height: 12),
+            InfoRow(label: 'العنوان', value: '$_ip:$kPort'),
+            const SizedBox(height: 8),
+            InfoRow(
+              label: 'رمز الدخول (PIN)',
+              value: _pin,
+              big: true,
+              trailing: IconButton(
+                icon: const Icon(Icons.refresh_rounded, size: 20),
+                color: Colors.white54,
+                onPressed: () {
+                  setState(() => _pin = _newPin());
+                  saveSettings({'campin': _pin});
+                },
               ),
             ),
+            const SizedBox(height: 10),
+            Row(children: [
+              Container(
+                width: 9,
+                height: 9,
+                decoration: BoxDecoration(
+                  color: _live ? kGreen : Colors.amber,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(_live ? 'متصل — يوجد مشاهد' : _status,
+                    style: const TextStyle(fontSize: 13, color: Colors.white70)),
+              ),
+            ]),
+            const SizedBox(height: 12),
+            if (Platform.isAndroid)
+              FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: _recording ? kRed : null,
+                  minimumSize: const Size.fromHeight(46),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14)),
+                ),
+                icon: Icon(_recording ? Icons.stop_rounded : Icons.fiber_manual_record),
+                label: Text(_recording ? 'إيقاف التسجيل' : 'تسجيل'),
+                onPressed: () async {
+                  await _toggleRec();
+                  _sendRec();
+                },
+              )
+            else
+              const Text('التسجيل متاح على Android فقط',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.white54, fontSize: 12)),
+            if (Platform.isAndroid)
+              TextButton.icon(
+                icon: const Icon(Icons.battery_saver, size: 18),
+                label: const Text('السماح بالعمل بالخلفية'),
+                onPressed: () => _svc.invokeMethod('battery'),
+              ),
           ]),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(10),
+            child: Row(children: [
+              Expanded(
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(20),
+                  child: Stack(fit: StackFit.expand, children: [
+                    Container(color: Colors.black),
+                    RTCVideoView(_local),
+                    Positioned(
+                      top: 10,
+                      right: 10,
+                      child: Row(children: [
+                        Pill(
+                            color: _live ? kRed : Colors.grey,
+                            text: _live ? 'LIVE' : 'STANDBY'),
+                        if (_recording) ...[
+                          const SizedBox(width: 8),
+                          const Pill(color: kRed, text: 'REC'),
+                        ],
+                        const SizedBox(width: 8),
+                        RoundIcon(
+                          icon: Icons.arrow_back_rounded,
+                          onTap: () => Navigator.maybePop(context),
+                        ),
+                      ]),
+                    ),
+                  ]),
+                ),
+              ),
+              const SizedBox(width: 10),
+              SizedBox(width: 264, child: _panel()),
+            ]),
+          ),
         ),
       );
 }
@@ -743,6 +1152,30 @@ class _ViewerPageState extends State<ViewerPage> {
         ],
       );
 
+  Widget _field(TextEditingController c, String label, String hint,
+          IconData icon, VoidCallback onTap, List<TextInputFormatter> fmt) =>
+      TextField(
+        controller: c,
+        keyboardType: TextInputType.none, // we use our own keypad
+        textDirection: TextDirection.ltr,
+        onTap: onTap,
+        inputFormatters: fmt,
+        style: const TextStyle(fontSize: 18, letterSpacing: 1),
+        decoration: InputDecoration(
+          labelText: label,
+          hintText: hint,
+          prefixIcon: Icon(icon, size: 20),
+          filled: true,
+          fillColor: kBg,
+          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+          border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+          focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(14),
+              borderSide: const BorderSide(color: kAccent, width: 1.5)),
+        ),
+      );
+
   @override
   Widget build(BuildContext context) {
     if (_wide) {
@@ -752,9 +1185,17 @@ class _ViewerPageState extends State<ViewerPage> {
           Positioned.fill(child: RTCVideoView(_remote)),
           Positioned(
             top: 8,
-            left: 12,
+            right: 12,
             child: SafeArea(
-              child: Text(_status, style: const TextStyle(color: Colors.white70)),
+              child: Row(children: [
+                Pill(
+                    color: _isConnected ? kRed : Colors.grey,
+                    text: _isConnected ? 'LIVE' : _status),
+                if (_remoteRec) ...[
+                  const SizedBox(width: 8),
+                  const Pill(color: kRed, text: 'REC'),
+                ],
+              ]),
             ),
           ),
           Positioned(
@@ -764,10 +1205,10 @@ class _ViewerPageState extends State<ViewerPage> {
             child: SafeArea(
               child: Container(
                 margin: const EdgeInsets.symmetric(horizontal: 60),
-                padding: const EdgeInsets.symmetric(vertical: 4),
+                padding: const EdgeInsets.symmetric(vertical: 6),
                 decoration: BoxDecoration(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(16),
+                  color: const Color(0x99000000),
+                  borderRadius: BorderRadius.circular(24),
                 ),
                 child: _controls(dark: true),
               ),
@@ -780,84 +1221,164 @@ class _ViewerPageState extends State<ViewerPage> {
     return Scaffold(
       appBar: AppBar(title: const Text('وضع المشاهدة')),
       body: Column(children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-          child: Row(children: [
-            Expanded(
-              flex: 3,
-              child: TextField(
-                controller: _ipCtl,
-                keyboardType: TextInputType.none, // we use our own keypad
-                onTap: () => setState(() => _pinActive = false),
-                inputFormatters: [
-                  FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))
-                ],
-                decoration: const InputDecoration(
-                  labelText: 'IP الكاميرا',
-                  hintText: '192.168.1.20',
-                ),
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              flex: 2,
-              child: TextField(
-                controller: _pinCtl,
-                keyboardType: TextInputType.none,
-                onTap: () => setState(() => _pinActive = true),
-                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                decoration: const InputDecoration(labelText: 'PIN'),
-              ),
-            ),
-          ]),
-        ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          child: Row(children: [
-            Expanded(
-              child: OutlinedButton.icon(
-                icon: _scanning
-                    ? const SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Icon(Icons.search),
-                label: const Text('بحث تلقائي'),
-                onPressed: _scanning ? null : _scan,
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: FilledButton.icon(
-                icon: const Icon(Icons.play_arrow),
-                label: const Text('اتصال'),
-                onPressed: _connect,
-              ),
-            ),
-          ]),
-        ),
-        if (_found.isNotEmpty)
-          Wrap(
-            spacing: 8,
-            children: [
-              for (final ip in _found)
-                ActionChip(
-                  avatar: const Icon(Icons.videocam, size: 18),
-                  label: Text(ip),
-                  onPressed: () => setState(() {
-                    _ipCtl.text = ip;
-                    _pinActive = true;
-                  }),
-                ),
-            ],
+        // ── connection card ──
+        Container(
+          margin: const EdgeInsets.fromLTRB(14, 4, 14, 8),
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: kSurface,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: Colors.white10),
           ),
-        Text(_status),
-        Expanded(child: RTCVideoView(_remote)),
-        Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Column(children: [
+            Row(children: [
+              Expanded(
+                flex: 3,
+                child: _field(
+                  _ipCtl,
+                  'IP الكاميرا',
+                  '192.168.1.20',
+                  Icons.wifi,
+                  () => setState(() => _pinActive = false),
+                  [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                flex: 2,
+                child: _field(
+                  _pinCtl,
+                  'PIN',
+                  '••••••',
+                  Icons.lock_outline,
+                  () => setState(() => _pinActive = true),
+                  [FilteringTextInputFormatter.digitsOnly],
+                ),
+              ),
+            ]),
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: const Size.fromHeight(46),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                  ),
+                  icon: _scanning
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.search_rounded),
+                  label: const Text('بحث تلقائي'),
+                  onPressed: _scanning ? null : _scan,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    minimumSize: const Size.fromHeight(46),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                  ),
+                  icon: const Icon(Icons.play_arrow_rounded),
+                  label: const Text('اتصال'),
+                  onPressed: _connect,
+                ),
+              ),
+            ]),
+            if (_found.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 8,
+                children: [
+                  for (final ip in _found)
+                    ActionChip(
+                      avatar: const Icon(Icons.videocam_rounded, size: 18),
+                      label: Text(ip),
+                      backgroundColor: kSurface2,
+                      onPressed: () => setState(() {
+                        _ipCtl.text = ip;
+                        _pinActive = true;
+                      }),
+                    ),
+                ],
+              ),
+            ],
+          ]),
+        ),
+
+        // ── status ──
+        if (_status.isNotEmpty)
+          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(
+                color: _isConnected ? kGreen : Colors.amber,
+                shape: BoxShape.circle,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(_status,
+                style: const TextStyle(fontSize: 13, color: Colors.white70)),
+          ]),
+
+        // ── video ──
+        Expanded(
+          child: Container(
+            margin: const EdgeInsets.fromLTRB(14, 8, 14, 0),
+            decoration: BoxDecoration(
+              color: Colors.black,
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: Colors.white10),
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(18),
+              child: Stack(fit: StackFit.expand, children: [
+                RTCVideoView(_remote),
+                if (_remote.srcObject == null)
+                  Container(
+                    color: Colors.black,
+                    child: const Center(
+                      child: Column(mainAxisSize: MainAxisSize.min, children: [
+                        Icon(Icons.videocam_off_outlined,
+                            size: 40, color: Colors.white24),
+                        SizedBox(height: 8),
+                        Text('لا يوجد بث',
+                            style: TextStyle(color: Colors.white38)),
+                      ]),
+                    ),
+                  ),
+                if (_isConnected)
+                  const Positioned(
+                      top: 10, right: 10, child: Pill(color: kRed, text: 'LIVE')),
+                if (_remoteRec)
+                  const Positioned(
+                      top: 10, left: 10, child: Pill(color: kRed, text: 'REC')),
+              ]),
+            ),
+          ),
+        ),
+
+        // ── controls ──
+        Container(
+          margin: const EdgeInsets.fromLTRB(14, 8, 14, 8),
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          decoration: BoxDecoration(
+            color: kSurface,
+            borderRadius: BorderRadius.circular(22),
+            border: Border.all(color: Colors.white10),
+          ),
           child: _controls(dark: false),
         ),
-        if (!_isConnected) Keypad(onKey: _key, onBack: _back),
+        if (!_isConnected)
+          SafeArea(
+            top: false,
+            child: Keypad(onKey: _key, onBack: _back),
+          ),
       ]),
     );
   }

@@ -35,7 +35,13 @@ jobs:
 
       - run: flutter pub get
 
-      - run: flutter build apk --release
+      - name: Build APK
+        shell: bash
+        run: flutter build apk --release --no-shrink 2>&1 | tee build.log
+
+      - name: Error summary
+        if: failure()
+        run: grep -B2 -A12 -E "What went wrong|error:|Error:" build.log | head -60 || true
 
       - uses: actions/upload-artifact@v4
         with:

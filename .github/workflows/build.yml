@@ -33,6 +33,11 @@ jobs:
             <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>' \
             android/app/src/main/AndroidManifest.xml
 
+      - name: Raise compileSdk to 36
+        run: |
+          sed -i -E 's/compileSdk(Version)? *=? *flutter\.compileSdkVersion/compileSdk = 36/' android/app/build.gradle*
+          grep -n compileSdk android/app/build.gradle*
+
       - run: flutter pub get
 
       - name: Build APK

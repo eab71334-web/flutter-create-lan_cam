@@ -42,11 +42,23 @@ jobs:
 
       - name: Build APK
         shell: bash
-        run: flutter build apk --release --no-shrink 2>&1 | tee build.log
+        run: |
+          set +e
+          flutter build apk --release --no-shrink 2>&1 | tee build.log
+          if [ ${PIPESTATUS[0]} -eq 0 ]; then exit 0; fi
+          V=$(grep -oE 'compile against version [0-9]+' build.log | grep -oE '[0-9]+' | sort -n | tail -1)
+          if [ -z "$V" ]; then exit 1; fi
+          echo "Retrying with compileSdk $V"
+          sed -i -E "s/compileSdk = [0-9]+/compileSdk = $V/" android/app/build.gradle*
+          echo "android.suppressUnsupportedCompileSdk=$V" >> android/gradle.properties
+          flutter build apk --release --no-shrink 2>&1 | tee build2.log
+          exit ${PIPESTATUS[0]}
 
       - name: Error summary
         if: failure()
-        run: grep -B2 -A12 -E "What went wrong|error:|Error:" build.log | head -60 || true
+        run: |
+          MSG=$(cat build*.log | grep -A8 -E "What went wrong" | head -c 1500 | sed ':a;N;$!ba;s/\n/%0A/g')
+          echo "::error title=Gradle error::$MSG"
 
       - uses: actions/upload-artifact@v4
         with:

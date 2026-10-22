@@ -33,26 +33,26 @@ jobs:
             <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>' \
             android/app/src/main/AndroidManifest.xml
 
-      - name: Raise compileSdk to 36
+      - name: Force compileSdk 36 for ALL modules (app + plugins)
         run: |
-          sed -i -E 's/compileSdk(Version)? *=? *flutter\.compileSdkVersion/compileSdk = 36/' android/app/build.gradle*
-          grep -n compileSdk android/app/build.gradle*
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/force-compilesdk.gradle << 'EOF'
+          allprojects {
+            afterEvaluate { p ->
+              def a = p.extensions.findByName('android')
+              if (a != null) {
+                try { a.compileSdk = 36 } catch (Throwable t) { a.compileSdkVersion(36) }
+              }
+            }
+          }
+          EOF
+          echo "android.suppressUnsupportedCompileSdk=36" >> android/gradle.properties
 
       - run: flutter pub get
 
       - name: Build APK
         shell: bash
-        run: |
-          set +e
-          flutter build apk --release --no-shrink 2>&1 | tee build.log
-          if [ ${PIPESTATUS[0]} -eq 0 ]; then exit 0; fi
-          V=$(grep -oE 'compile against version [0-9]+' build.log | grep -oE '[0-9]+' | sort -n | tail -1)
-          if [ -z "$V" ]; then exit 1; fi
-          echo "Retrying with compileSdk $V"
-          sed -i -E "s/compileSdk = [0-9]+/compileSdk = $V/" android/app/build.gradle*
-          echo "android.suppressUnsupportedCompileSdk=$V" >> android/gradle.properties
-          flutter build apk --release --no-shrink 2>&1 | tee build2.log
-          exit ${PIPESTATUS[0]}
+        run: flutter build apk --release --no-shrink 2>&1 | tee build.log
 
       - name: Error summary
         if: failure()

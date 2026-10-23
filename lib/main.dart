@@ -628,6 +628,8 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   String _status = 'بانتظار المشاهد';
   bool _recording = false;
   bool _always = false;
+  Map _diag = {};
+  Timer? _diagTimer;
 
   @override
   void initState() {
@@ -718,6 +720,9 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       });
     });
     if (mounted) setState(() {});
+    _refreshDiag();
+    _diagTimer =
+        Timer.periodic(const Duration(seconds: 3), (_) => _refreshDiag());
 
     // Woken remotely while the app was closed: hide again once we are live.
     if (widget.autoMinimize && Platform.isAndroid) {
@@ -796,6 +801,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   @override
   void dispose() {
     CameraPage.active = false;
+    _diagTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable();
     if (Platform.isAndroid) {
@@ -842,6 +848,52 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       await _svc.invokeMethod('config', {'always': v, 'pin': _pin});
       await _svc.invokeMethod('start'); // re-apply (starts/stops the listener)
     } catch (_) {}
+    _refreshDiag();
+  }
+
+  Future<void> _refreshDiag() async {
+    if (!Platform.isAndroid) return;
+    try {
+      final m = await _svc.invokeMethod<Map>('status');
+      if (mounted && m != null) setState(() => _diag = m);
+    } catch (_) {}
+  }
+
+  Widget _diagRow(String label, bool ok) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(children: [
+          Icon(ok ? Icons.check_circle : Icons.cancel,
+              size: 14, color: ok ? kGreen : kRed),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(label,
+                style: const TextStyle(fontSize: 11, color: Colors.white70)),
+          ),
+        ]),
+      );
+
+  Widget _diagBox() {
+    final err = (_diag['error'] as String?) ?? '';
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: kBg,
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        _diagRow('الخدمة في الخلفية', _diag['running'] == true),
+        _diagRow('منفذ الإيقاظ $kWakePort', _diag['listening'] == true),
+        _diagRow('الظهور فوق التطبيقات', _diag['overlay'] == true),
+        _diagRow('توفير البطارية مستثنى', _diag['battery'] == true),
+        if (err.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: SelectableText(err,
+                style: const TextStyle(fontSize: 10, color: Colors.amber)),
+          ),
+      ]),
+    );
   }
 
   bool get _live => _status == 'Connected';
@@ -921,6 +973,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
                   onChanged: _toggleAlways,
                 ),
               ),
+            if (Platform.isAndroid && _always) _diagBox(),
             if (Platform.isAndroid)
               FilledButton.icon(
                 style: FilledButton.styleFrom(
@@ -1107,7 +1160,7 @@ class _ViewerPageState extends State<ViewerPage> {
         // camera app is closed: wake it (standby listener on the camera phone)
         setState(() => _status = 'الكاميرا مغلقة — جاري إيقاظها...');
         final woke = await _wakeCamera(ip, _pinCtl.text);
-        if (!woke) throw 'wake-failed';
+        if (woke != 'ok') throw 'wake-$woke';
         var up = false;
         for (var i = 0; i < 25 && !up; i++) {
           await Future.delayed(const Duration(seconds: 1));
@@ -1219,10 +1272,16 @@ class _ViewerPageState extends State<ViewerPage> {
     }
   }
 
-  Future<bool> _wakeCamera(String ip, String pin) async {
+  /// 'ok' | 'unreachable' (port closed / wrong IP) | 'denied' (PIN / feature off) | 'noreply'
+  Future<String> _wakeCamera(String ip, String pin) async {
+    Socket s;
     try {
-      final s = await Socket.connect(ip, kWakePort,
-          timeout: const Duration(seconds: 2));
+      s = await Socket.connect(ip, kWakePort,
+          timeout: const Duration(seconds: 3));
+    } catch (_) {
+      return 'unreachable';
+    }
+    try {
       s.write('WAKE:$pin\n');
       await s.flush();
       final reply = await s
@@ -1231,16 +1290,23 @@ class _ViewerPageState extends State<ViewerPage> {
           .join()
           .timeout(const Duration(seconds: 5), onTimeout: () => '');
       s.destroy();
-      return reply.trim() == 'OK';
+      final r = reply.trim();
+      if (r == 'OK') return 'ok';
+      if (r == 'DENIED') return 'denied';
+      return 'noreply';
     } catch (_) {
-      return false;
+      return 'noreply';
     }
   }
 
   String _friendly(Object e) {
-    if (e == 'wake-failed') {
-      return 'تعذّر إيقاظ الكاميرا — تأكد من IP وPIN وأن "جاهزية دائمة" مفعّلة';
+    if (e == 'wake-unreachable') {
+      return 'الكاميرا لا تستقبل طلب الإيقاظ (المنفذ $kWakePort مغلق): الخدمة متوقفة على جهاز الكاميرا أو الـ IP غير صحيح';
     }
+    if (e == 'wake-denied') {
+      return 'الكاميرا رفضت الطلب: الـ PIN غير صحيح أو "جاهزية دائمة" غير مفعّلة';
+    }
+    if (e == 'wake-noreply') return 'الكاميرا ما ردّت على طلب الإيقاظ';
     if (e == 'wake-timeout') {
       return 'الكاميرا ما استجابت — افتح التطبيق على جهاز الكاميرا مرة واحدة';
     }
@@ -1514,7 +1580,7 @@ class _ViewerPageState extends State<ViewerPage> {
             const SizedBox(width: 8),
             Flexible(
               child: Text(_status,
-                  maxLines: 2,
+                  maxLines: 4,
                   overflow: TextOverflow.ellipsis,
                   textAlign: TextAlign.center,
                   style: const TextStyle(fontSize: 13, color: Colors.white70)),

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -18,6 +19,7 @@ const Map<String, dynamic> kPcConfig = {
 };
 
 const MethodChannel _svc = MethodChannel('lancam/service');
+const EventChannel _screenEvents = EventChannel('lancam/screen');
 
 // ── design tokens ──
 const Color kBg = Color(0xFF0B1220);
@@ -573,6 +575,28 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
                       onTap: () => Navigator.push(context,
                           MaterialPageRoute(builder: (_) => const ViewerPage())),
                     ),
+                    const SizedBox(height: 14),
+                    ModeCard(
+                      icon: Icons.phone_android_rounded,
+                      title: 'شاشة الهاتف',
+                      subtitle: 'اعرض شاشة هاتف آخر وتحكم به عن بعد',
+                      color: const Color(0xFF34D399),
+                      tint: const Color(0x2634D399),
+                      onTap: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                              builder: (_) => const ViewerPage(screen: true))),
+                    ),
+                    const SizedBox(height: 14),
+                    ModeCard(
+                      icon: Icons.tune_rounded,
+                      title: 'إعدادات البث',
+                      subtitle: 'الدقة، الإطارات، معدل البيانات وغيرها',
+                      color: const Color(0xFFFBBF24),
+                      tint: const Color(0x26FBBF24),
+                      onTap: () => Navigator.push(context,
+                          MaterialPageRoute(builder: (_) => const SettingsPage())),
+                    ),
                     const SizedBox(height: 28),
                     Wrap(
                       alignment: WrapAlignment.center,
@@ -607,6 +631,111 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
       );
 }
 
+// ───────────────────────────── Settings ─────────────────────────────
+class SettingsPage extends StatefulWidget {
+  const SettingsPage({super.key});
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<SettingsPage> {
+  Map<String, dynamic> _s = {};
+
+  @override
+  void initState() {
+    super.initState();
+    loadSettings().then((m) {
+      if (mounted) setState(() => _s = m);
+    });
+  }
+
+  void _set(String k, Object v) {
+    setState(() => _s[k] = v);
+    saveSettings({k: v});
+  }
+
+  Widget _chips<T>(String label, String key, T def, List<T> values,
+      List<String> labels) {
+    final cur = _s[key] is T ? _s[key] as T : def;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(label,
+            style: const TextStyle(fontSize: 13, color: Colors.white70)),
+        const SizedBox(height: 8),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          for (var i = 0; i < values.length; i++)
+            ChoiceChip(
+              label: Text(labels[i]),
+              selected: values[i] == cur,
+              onSelected: (_) => _set(key, values[i] as Object),
+            ),
+        ]),
+      ]),
+    );
+  }
+
+  Widget _group(String title, IconData icon, List<Widget> children) =>
+      Container(
+        margin: const EdgeInsets.fromLTRB(14, 0, 14, 12),
+        padding: const EdgeInsets.fromLTRB(14, 14, 14, 2),
+        decoration: BoxDecoration(
+          color: kSurface,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: Colors.white10),
+        ),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Icon(icon, color: kAccent, size: 20),
+            const SizedBox(width: 8),
+            Text(title,
+                style:
+                    const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+          ]),
+          const SizedBox(height: 14),
+          ...children,
+        ]),
+      );
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('إعدادات البث')),
+        body: ListView(padding: const EdgeInsets.only(bottom: 24), children: [
+          _group('البث (جهاز الكاميرا)', Icons.videocam_rounded, [
+            _chips<int>('الدقة', 'res', 720, [360, 480, 720, 1080],
+                ['360p', '480p', '720p HD', '1080p FHD']),
+            _chips<int>('الإطارات في الثانية (FPS)', 'fps', 30,
+                [10, 15, 24, 30, 60], ['10', '15', '24', '30', '60']),
+            _chips<int>('أقصى معدل بيانات', 'bitrate', 0,
+                [0, 500, 1000, 2500, 5000],
+                ['تلقائي', '0.5 Mbps', '1 Mbps', '2.5 Mbps', '5 Mbps']),
+            _chips<String>('الكاميرا', 'facing', 'environment',
+                ['environment', 'user'], ['الخلفية', 'الأمامية']),
+            _chips<bool>(
+                'صوت الكاميرا', 'mic', true, [true, false], ['مفعّل', 'مكتوم']),
+          ]),
+          _group('المشاهدة', Icons.visibility_rounded, [
+            _chips<String>('عرض الفيديو', 'fit', 'contain',
+                ['contain', 'cover'], ['كامل بدون قص', 'ملء الشاشة (قص)']),
+            _chips<bool>('الدخول للشاشة العريضة تلقائياً', 'autoWide', true,
+                [true, false], ['نعم', 'لا']),
+          ]),
+          _group('مشاركة الشاشة والتحكم', Icons.phone_android_rounded, [
+            _chips<int>('الإطارات', 'sfps', 10, [5, 10, 15], ['5', '10', '15']),
+            _chips<int>('جودة الصورة', 'squality', 60, [40, 60, 80],
+                ['منخفضة', 'متوسطة', 'عالية']),
+            _chips<int>('الدقة', 'sside', 1280, [960, 1280, 1920],
+                ['منخفضة', 'متوسطة', 'عالية']),
+          ]),
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 22),
+            child: Text('إعدادات البث والصوت تُطبّق عند فتح وضع الكاميرا من جديد.',
+                style: TextStyle(fontSize: 12, color: Colors.white54)),
+          ),
+        ]),
+      );
+}
+
 // ───────────────────────── Camera (broadcaster) ─────────────────────────
 class CameraPage extends StatefulWidget {
   const CameraPage({super.key, this.autoMinimize = false});
@@ -629,7 +758,14 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   bool _recording = false;
   bool _always = false;
   Map _diag = {};
+  Map _screen = {};
   Timer? _diagTimer;
+  WebSocket? _screenWs;
+  StreamSubscription? _screenSub;
+  int _screenW = 0;
+  int _screenH = 0;
+  int _kbps = 0;
+  int _fps = 30;
 
   @override
   void initState() {
@@ -655,24 +791,42 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     await Future.delayed(const Duration(milliseconds: 600));
     await [Permission.camera, Permission.microphone].request();
     await _local.initialize();
+    final hRes = (s['res'] as int?) ?? 720;
+    final wRes = (hRes * 16 / 9).round();
+    final fps = (s['fps'] as int?) ?? 30;
+    final facing = (s['facing'] as String?) ?? 'environment';
+    final mic = (s['mic'] as bool?) ?? true;
+    _kbps = (s['bitrate'] as int?) ?? 0;
+    _fps = fps;
     try {
       _stream = await navigator.mediaDevices.getUserMedia({
-        'audio': true,
+        'audio': mic,
         'video': {
           'mandatory': {
-            'minWidth': '1280',
-            'minHeight': '720',
-            'minFrameRate': '24'
+            'minWidth': '$wRes',
+            'minHeight': '$hRes',
+            'minFrameRate': '$fps'
           },
-          'facingMode': 'environment',
+          'facingMode': facing,
           'optional': [],
         },
       });
     } catch (_) {
-      _stream = await navigator.mediaDevices.getUserMedia({
-        'audio': true,
-        'video': {'facingMode': 'environment'},
-      });
+      try {
+        _stream = await navigator.mediaDevices.getUserMedia({
+          'audio': mic,
+          'video': {
+            'mandatory': {'minWidth': '$wRes', 'minHeight': '$hRes'},
+            'facingMode': facing,
+            'optional': [],
+          },
+        });
+      } catch (_) {
+        _stream = await navigator.mediaDevices.getUserMedia({
+          'audio': mic,
+          'video': {'facingMode': facing},
+        });
+      }
     }
     _local.srcObject = _stream;
     _ip = await localIp() ?? '...';
@@ -697,7 +851,8 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       final ws = await WebSocketTransformer.upgrade(req);
       var authed = false;
       ws.listen((m) async {
-        final d = jsonDecode(m as String);
+        if (m is! String) return;
+        final d = jsonDecode(m);
         switch (d['type']) {
           case 'offer':
             if ((d['pin'] ?? '') != _pin) {
@@ -716,8 +871,22 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
           case 'cmd':
             if (authed) await _cmd(d);
             break;
+          case 'screen':
+            if ((d['pin'] ?? '') != _pin) {
+              ws.add(jsonEncode({'type': 'denied'}));
+              await ws.close();
+              return;
+            }
+            authed = true;
+            await _attachScreen(ws);
+            break;
+          case 'tap':
+          case 'swipe':
+          case 'nav':
+            if (authed) await _remoteInput(d);
+            break;
         }
-      });
+      }, onDone: () => _detachScreen(ws));
     });
     if (mounted) setState(() {});
     _refreshDiag();
@@ -743,6 +912,9 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       if (mounted) {
         setState(() => _status = s.name.replaceAll('RTCPeerConnectionState', ''));
       }
+      if (s == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        _applyEncoding(pc);
+      }
     };
     await pc.setRemoteDescription(RTCSessionDescription(sdp, 'offer'));
     final ans = await pc.createAnswer();
@@ -750,6 +922,154 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     await waitIceGathered(pc);
     final l = await pc.getLocalDescription();
     ws.add(jsonEncode({'type': 'answer', 'sdp': l!.sdp}));
+  }
+
+  /// Apply the max bitrate / fps from the settings to the video sender.
+  Future<void> _applyEncoding(RTCPeerConnection pc) async {
+    if (_kbps <= 0) return;
+    try {
+      final senders = await pc.getSenders();
+      for (final snd in senders) {
+        if (snd.track?.kind != 'video') continue;
+        final p = (snd as dynamic).parameters;
+        final encs = p.encodings as List?;
+        if (encs == null || encs.isEmpty) continue;
+        for (final e in encs) {
+          (e as dynamic).maxBitrate = _kbps * 1000;
+          (e as dynamic).maxFramerate = _fps;
+        }
+        await (snd as dynamic).setParameters(p);
+      }
+    } catch (_) {}
+  }
+
+  // ── phone screen sharing + remote control (Android host) ──
+  Future<void> _attachScreen(WebSocket ws) async {
+    Map info = {};
+    try {
+      info = (await _svc.invokeMethod<Map>('screenInfo')) ?? {};
+    } catch (_) {}
+    if (info['running'] != true) {
+      ws.add(jsonEncode({
+        'type': 'screen_error',
+        'msg':
+            'مشاركة الشاشة غير مفعّلة على الجهاز الآخر — افتح التطبيق هناك واضغط "بدء مشاركة الشاشة"'
+      }));
+      return;
+    }
+    _screenW = (info['w'] as int?) ?? 0;
+    _screenH = (info['h'] as int?) ?? 0;
+    _screenSub?.cancel();
+    _screenWs = ws;
+    ws.add(jsonEncode({
+      'type': 'screen_info',
+      'w': _screenW,
+      'h': _screenH,
+      'control': info['control'] == true,
+    }));
+    try {
+      await _svc.invokeMethod('screenWanted', {'on': true});
+    } catch (_) {}
+    _screenSub = _screenEvents.receiveBroadcastStream().listen((data) {
+      if (data is Uint8List) {
+        try {
+          ws.add(data);
+        } catch (_) {}
+      }
+    });
+  }
+
+  void _detachScreen(WebSocket ws) {
+    if (!identical(_screenWs, ws)) return;
+    _screenSub?.cancel();
+    _screenSub = null;
+    _screenWs = null;
+    if (Platform.isAndroid) {
+      _svc.invokeMethod('screenWanted', {'on': false}).catchError((_) {});
+    }
+  }
+
+  Future<void> _remoteInput(Map d) async {
+    if (_screenW == 0 || _screenH == 0) return;
+    try {
+      switch (d['type']) {
+        case 'tap':
+          await _svc.invokeMethod('tap', {
+            'x': ((d['x'] as num) * _screenW).toDouble(),
+            'y': ((d['y'] as num) * _screenH).toDouble(),
+          });
+          break;
+        case 'swipe':
+          await _svc.invokeMethod('swipe', {
+            'x1': ((d['x1'] as num) * _screenW).toDouble(),
+            'y1': ((d['y1'] as num) * _screenH).toDouble(),
+            'x2': ((d['x2'] as num) * _screenW).toDouble(),
+            'y2': ((d['y2'] as num) * _screenH).toDouble(),
+            'ms': (d['ms'] as num).toInt(),
+          });
+          break;
+        case 'nav':
+          await _svc.invokeMethod('nav', {'action': d['action']});
+          break;
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _startScreen() async {
+    final cfg = await loadSettings();
+    try {
+      await _svc.invokeMethod('screenConfig', {
+        'fps': (cfg['sfps'] as int?) ?? 10,
+        'quality': (cfg['squality'] as int?) ?? 60,
+        'maxSide': (cfg['sside'] as int?) ?? 1280,
+      });
+      await _svc.invokeMethod('screenStart');
+    } catch (_) {}
+    Future.delayed(const Duration(seconds: 2), _refreshDiag);
+  }
+
+  Future<void> _stopScreen() async {
+    try {
+      await _svc.invokeMethod('screenStop');
+    } catch (_) {}
+    _refreshDiag();
+  }
+
+  Widget _screenBox() {
+    final running = _screen['running'] == true;
+    final control = _screen['control'] == true;
+    final err = (_screen['error'] as String?) ?? '';
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: kBg,
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        const Text('مشاركة الشاشة والتحكم',
+            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700)),
+        const SizedBox(height: 6),
+        _diagRow('الشاشة جاهزة للمشاهدة', running),
+        _diagRow('التحكم عن بعد مفعّل', control),
+        if (err.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(err,
+                style: const TextStyle(fontSize: 10, color: Colors.amber)),
+          ),
+        const SizedBox(height: 6),
+        OutlinedButton(
+          onPressed: running ? _stopScreen : _startScreen,
+          child: Text(running ? 'إيقاف مشاركة الشاشة' : 'بدء مشاركة الشاشة'),
+        ),
+        if (!control)
+          TextButton(
+            onPressed: () => _svc.invokeMethod('openAccessibility'),
+            child: const Text('تفعيل التحكم (إمكانية الوصول)'),
+          ),
+      ]),
+    );
   }
 
   /// Remote controls from the viewer: switch camera / flashlight.
@@ -802,6 +1122,10 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   void dispose() {
     CameraPage.active = false;
     _diagTimer?.cancel();
+    _screenSub?.cancel();
+    if (Platform.isAndroid) {
+      _svc.invokeMethod('screenStop').catchError((_) {});
+    }
     WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable();
     if (Platform.isAndroid) {
@@ -855,7 +1179,13 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     if (!Platform.isAndroid) return;
     try {
       final m = await _svc.invokeMethod<Map>('status');
-      if (mounted && m != null) setState(() => _diag = m);
+      final sc = await _svc.invokeMethod<Map>('screenInfo');
+      if (mounted) {
+        setState(() {
+          if (m != null) _diag = m;
+          if (sc != null) _screen = sc;
+        });
+      }
     } catch (_) {}
   }
 
@@ -974,6 +1304,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
                 ),
               ),
             if (Platform.isAndroid && _always) _diagBox(),
+            if (Platform.isAndroid) _screenBox(),
             if (Platform.isAndroid)
               FilledButton.icon(
                 style: FilledButton.styleFrom(
@@ -1055,12 +1386,13 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
 
 // ───────────────────────────── Viewer ─────────────────────────────
 class ViewerPage extends StatefulWidget {
-  const ViewerPage({super.key});
+  const ViewerPage({super.key, this.screen = false});
+  final bool screen; // true = view + control another phone's screen
   @override
   State<ViewerPage> createState() => _ViewerPageState();
 }
 
-class _ViewerPageState extends State<ViewerPage> {
+class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
   final _remote = RTCVideoRenderer();
   final _ipCtl = TextEditingController();
   final _pinCtl = TextEditingController();
@@ -1080,17 +1412,44 @@ class _ViewerPageState extends State<ViewerPage> {
   bool _muted = false;
   bool _torch = false;
   bool _remoteRec = false;
+  bool _fitCover = false;
+  bool _autoWide = true;
+  // phone-screen mode
+  Uint8List? _frame;
+  int _sw = 0;
+  int _sh = 0;
+  bool _ctl = false;
+  Offset? _panStart;
+  Offset? _panLast;
+  DateTime _panT = DateTime.now();
+
+  RTCVideoViewObjectFit get _fit => _fitCover
+      ? RTCVideoViewObjectFit.RTCVideoViewObjectFitCover
+      : RTCVideoViewObjectFit.RTCVideoViewObjectFitContain;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     WakelockPlus.enable();
     _remote.initialize();
     loadSettings().then((s) {
       if (!mounted) return;
       _ipCtl.text = (s['ip'] as String?) ?? '';
       _pinCtl.text = (s['pin'] as String?) ?? '';
+      setState(() {
+        _fitCover = (s['fit'] as String?) == 'cover';
+        _autoWide = (s['autoWide'] as bool?) ?? true;
+      });
     });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // coming back to the app: keep the wide screen
+    if (state == AppLifecycleState.resumed && _wide) {
+      _landscape(immersive: true);
+    }
   }
 
   void _snack(String m) {
@@ -1169,6 +1528,10 @@ class _ViewerPageState extends State<ViewerPage> {
         if (!up) throw 'wake-timeout';
         if (mounted) setState(() => _status = 'جاري الاتصال...');
       }
+      if (widget.screen) {
+        await _connectScreen(ip);
+        return;
+      }
       await _pc?.close();
       _ws?.close();
       final ws = _ws = await WebSocket.connect('ws://$ip:$kPort')
@@ -1221,7 +1584,7 @@ class _ViewerPageState extends State<ViewerPage> {
           _isConnected =
               s == RTCPeerConnectionState.RTCPeerConnectionStateConnected;
         });
-        if (_isConnected && !_autoWideDone) {
+        if (_isConnected && _autoWide && !_autoWideDone) {
           _autoWideDone = true;
           _setWide(true); // go wide automatically once connected
         }
@@ -1260,6 +1623,166 @@ class _ViewerPageState extends State<ViewerPage> {
       if (mounted) setState(() => _status = _friendly(e));
     }
   }
+
+  Future<void> _connectScreen(String ip) async {
+    _ws?.close();
+    _frame = null;
+    final ws = _ws = await WebSocket.connect('ws://$ip:$kPort')
+        .timeout(const Duration(seconds: 5));
+    ws.listen((m) {
+      if (!mounted) return;
+      if (m is String) {
+        final d = jsonDecode(m);
+        switch (d['type']) {
+          case 'screen_info':
+            setState(() {
+              _sw = (d['w'] as num).toInt();
+              _sh = (d['h'] as num).toInt();
+              _ctl = d['control'] == true;
+              _isConnected = true;
+              _status = _ctl
+                  ? 'متصل — التحكم مفعّل'
+                  : 'متصل — عرض فقط (فعّل التحكم على الجهاز الآخر)';
+            });
+            if (_autoWide && !_autoWideDone) {
+              _autoWideDone = true;
+              _setWide(true);
+            }
+            break;
+          case 'screen_error':
+            setState(() => _status = d['msg'] as String);
+            break;
+          case 'denied':
+            _denied = true;
+            setState(() => _status = 'PIN غير صحيح');
+            _snack('PIN غير صحيح');
+            ws.close();
+            break;
+        }
+      } else if (m is List<int>) {
+        setState(() => _frame = m is Uint8List ? m : Uint8List.fromList(m));
+      }
+    }, onDone: () {
+      if (mounted && !_denied) {
+        setState(() {
+          _status = 'انقطع الاتصال';
+          _isConnected = false;
+        });
+      }
+    });
+    ws.add(jsonEncode({'type': 'screen', 'pin': _pinCtl.text}));
+  }
+
+  Offset? _toNorm(Offset p, Size box) {
+    if (_sw == 0 || _sh == 0) return null;
+    final sc = min(box.width / _sw, box.height / _sh);
+    final dw = _sw * sc;
+    final dh = _sh * sc;
+    final ox = (box.width - dw) / 2;
+    final oy = (box.height - dh) / 2;
+    final nx = (p.dx - ox) / dw;
+    final ny = (p.dy - oy) / dh;
+    if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return null;
+    return Offset(nx, ny);
+  }
+
+  /// The other phone's screen, with touch -> remote tap / swipe / long-press.
+  Widget _screenArea() => LayoutBuilder(builder: (context, c) {
+        final box = Size(c.maxWidth, c.maxHeight);
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapUp: (d) {
+            final n = _toNorm(d.localPosition, box);
+            if (n != null) _send({'type': 'tap', 'x': n.dx, 'y': n.dy});
+          },
+          onLongPressStart: (d) {
+            final n = _toNorm(d.localPosition, box);
+            if (n != null) {
+              _send({
+                'type': 'swipe',
+                'x1': n.dx,
+                'y1': n.dy,
+                'x2': n.dx,
+                'y2': n.dy,
+                'ms': 700
+              });
+            }
+          },
+          onPanStart: (d) {
+            _panStart = d.localPosition;
+            _panLast = d.localPosition;
+            _panT = DateTime.now();
+          },
+          onPanUpdate: (d) => _panLast = d.localPosition,
+          onPanEnd: (d) {
+            final a = _panStart;
+            final b = _panLast;
+            if (a == null || b == null) return;
+            final na = _toNorm(a, box);
+            final nb = _toNorm(b, box);
+            if (na == null || nb == null) return;
+            final ms =
+                DateTime.now().difference(_panT).inMilliseconds.clamp(80, 1200);
+            _send({
+              'type': 'swipe',
+              'x1': na.dx,
+              'y1': na.dy,
+              'x2': nb.dx,
+              'y2': nb.dy,
+              'ms': ms.toInt(),
+            });
+          },
+          child: Stack(fit: StackFit.expand, children: [
+            Container(color: Colors.black),
+            if (_frame != null)
+              Image.memory(_frame!,
+                  gaplessPlayback: true,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, __, ___) => const SizedBox()),
+            if (_frame == null)
+              const Center(
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(Icons.phone_android_rounded,
+                      size: 40, color: Colors.white24),
+                  SizedBox(height: 8),
+                  Text('لا يوجد بث للشاشة',
+                      style: TextStyle(color: Colors.white38)),
+                ]),
+              ),
+          ]),
+        );
+      });
+
+  Widget _screenControls({required bool dark}) => Row(
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        children: [
+          CtlButton(
+              icon: Icons.arrow_back,
+              label: 'رجوع',
+              dark: dark,
+              onTap: () => _send({'type': 'nav', 'action': 'back'})),
+          CtlButton(
+              icon: Icons.home_rounded,
+              label: 'الرئيسية',
+              dark: dark,
+              onTap: () => _send({'type': 'nav', 'action': 'home'})),
+          CtlButton(
+              icon: Icons.apps_rounded,
+              label: 'التطبيقات',
+              dark: dark,
+              onTap: () => _send({'type': 'nav', 'action': 'recents'})),
+          CtlButton(
+              icon: Icons.notifications_rounded,
+              label: 'الإشعارات',
+              dark: dark,
+              onTap: () => _send({'type': 'nav', 'action': 'notifications'})),
+          CtlButton(
+              icon: _wide ? Icons.fullscreen_exit : Icons.fullscreen,
+              label: _wide ? 'تصغير' : 'عريض',
+              dark: dark,
+              onTap: () => _setWide(!_wide)),
+        ],
+      );
 
   Future<bool> _portOpen(String ip, int port) async {
     try {
@@ -1356,6 +1879,7 @@ class _ViewerPageState extends State<ViewerPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable();
     _pc?.close();
     _ws?.close();
@@ -1438,7 +1962,10 @@ class _ViewerPageState extends State<ViewerPage> {
       return Scaffold(
         backgroundColor: Colors.black,
         body: Stack(children: [
-          Positioned.fill(child: RTCVideoView(_remote)),
+          Positioned.fill(
+              child: widget.screen
+                  ? _screenArea()
+                  : RTCVideoView(_remote, objectFit: _fit)),
           Positioned(
             top: 8,
             right: 12,
@@ -1466,7 +1993,9 @@ class _ViewerPageState extends State<ViewerPage> {
                   color: const Color(0x99000000),
                   borderRadius: BorderRadius.circular(24),
                 ),
-                child: _controls(dark: true),
+                child: widget.screen
+                    ? _screenControls(dark: true)
+                    : _controls(dark: true),
               ),
             ),
           ),
@@ -1475,7 +2004,8 @@ class _ViewerPageState extends State<ViewerPage> {
     }
 
     return Scaffold(
-      appBar: AppBar(title: const Text('وضع المشاهدة')),
+      appBar: AppBar(
+          title: Text(widget.screen ? 'شاشة الهاتف' : 'وضع المشاهدة')),
       body: Column(children: [
         // ── connection card ──
         Container(
@@ -1599,8 +2129,10 @@ class _ViewerPageState extends State<ViewerPage> {
             child: ClipRRect(
               borderRadius: BorderRadius.circular(18),
               child: Stack(fit: StackFit.expand, children: [
-                RTCVideoView(_remote),
-                if (_remote.srcObject == null)
+                widget.screen
+                    ? _screenArea()
+                    : RTCVideoView(_remote, objectFit: _fit),
+                if (!widget.screen && _remote.srcObject == null)
                   Container(
                     color: Colors.black,
                     child: const Center(
@@ -1633,7 +2165,9 @@ class _ViewerPageState extends State<ViewerPage> {
             borderRadius: BorderRadius.circular(22),
             border: Border.all(color: Colors.white10),
           ),
-          child: _controls(dark: false),
+          child: widget.screen
+              ? _screenControls(dark: false)
+              : _controls(dark: false),
         ),
         if (!_isConnected)
           SafeArea(

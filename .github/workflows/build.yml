@@ -817,7 +817,8 @@ jobs:
             <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>\
             <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>\
             <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>\
-            <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>' \
+            <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>\
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>' \
             android/app/src/main/AndroidManifest.xml
 
       - name: Add background camera service (Android)
@@ -845,8 +846,10 @@ jobs:
           cat > $D/MainActivity.kt << 'EOF'
           package com.example.lan_cam
 
+          import android.app.Activity
           import android.content.Context
           import android.content.Intent
+          import android.media.projection.MediaProjectionManager
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
@@ -855,6 +858,7 @@ jobs:
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
           import io.flutter.embedding.engine.FlutterEngineCache
+          import io.flutter.plugin.common.EventChannel
           import io.flutter.plugin.common.MethodChannel
 
           class MainActivity : FlutterActivity() {
@@ -895,6 +899,26 @@ jobs:
                   }
               }
 
+              // result of the "record your screen?" system dialog
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == REQ_SCREEN) {
+                      if (resultCode == Activity.RESULT_OK && data != null) {
+                          val i = Intent(applicationContext, ScreenService::class.java)
+                          i.putExtra("code", resultCode)
+                          i.putExtra("data", data)
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                              applicationContext.startForegroundService(i)
+                          } else {
+                              applicationContext.startService(i)
+                          }
+                      } else {
+                          ScreenBridge.lastError = "تم رفض إذن مشاركة الشاشة"
+                      }
+                  }
+              }
+
               private fun startSvc(action: String) {
                   val i = Intent(applicationContext, CamService::class.java).setAction(action)
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -906,6 +930,19 @@ jobs:
 
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
+                  if (ScreenBridge.channelFor !== flutterEngine) {
+                      ScreenBridge.channelFor = flutterEngine
+                      EventChannel(flutterEngine.dartExecutor.binaryMessenger, "lancam/screen")
+                          .setStreamHandler(object : EventChannel.StreamHandler {
+                              override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                                  ScreenBridge.sink = events
+                              }
+
+                              override fun onCancel(arguments: Any?) {
+                                  ScreenBridge.sink = null
+                              }
+                          })
+                  }
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "lancam/service")
                       .setMethodCallHandler { call, result ->
                           when (call.method) {
@@ -955,6 +992,68 @@ jobs:
                                   pendingAutostart = false
                                   result.success(v)
                               }
+                              "screenStart" -> {
+                                  try {
+                                      ScreenBridge.lastError = ""
+                                      val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                                      startActivityForResult(mpm.createScreenCaptureIntent(), REQ_SCREEN)
+                                      result.success(true)
+                                  } catch (e: Exception) {
+                                      ScreenBridge.lastError = "screenStart: " + e.toString()
+                                      result.success(false)
+                                  }
+                              }
+                              "screenStop" -> {
+                                  applicationContext.stopService(Intent(applicationContext, ScreenService::class.java))
+                                  ScreenBridge.wanted = false
+                                  result.success(true)
+                              }
+                              "screenWanted" -> {
+                                  ScreenBridge.wanted = call.argument<Boolean>("on") ?: false
+                                  result.success(true)
+                              }
+                              "screenConfig" -> {
+                                  call.argument<Int>("fps")?.let { ScreenBridge.fps = it }
+                                  call.argument<Int>("quality")?.let { ScreenBridge.quality = it }
+                                  call.argument<Int>("maxSide")?.let { ScreenBridge.maxSide = it }
+                                  result.success(true)
+                              }
+                              "screenInfo" -> {
+                                  val m = HashMap<String, Any>()
+                                  m["w"] = ScreenBridge.realW
+                                  m["h"] = ScreenBridge.realH
+                                  m["running"] = ScreenBridge.running
+                                  m["error"] = ScreenBridge.lastError
+                                  m["control"] = ControlService.instance != null
+                                  result.success(m)
+                              }
+                              "openAccessibility" -> {
+                                  try {
+                                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                                      result.success(true)
+                                  } catch (e: Exception) {
+                                      result.success(false)
+                                  }
+                              }
+                              "tap" -> {
+                                  val x = (call.argument<Double>("x") ?: 0.0).toFloat()
+                                  val yy = (call.argument<Double>("y") ?: 0.0).toFloat()
+                                  ControlService.instance?.gesture(x, yy, x, yy, 60)
+                                  result.success(ControlService.instance != null)
+                              }
+                              "swipe" -> {
+                                  val x1 = (call.argument<Double>("x1") ?: 0.0).toFloat()
+                                  val y1 = (call.argument<Double>("y1") ?: 0.0).toFloat()
+                                  val x2 = (call.argument<Double>("x2") ?: 0.0).toFloat()
+                                  val y2 = (call.argument<Double>("y2") ?: 0.0).toFloat()
+                                  val ms = (call.argument<Int>("ms") ?: 300).toLong()
+                                  ControlService.instance?.gesture(x1, y1, x2, y2, ms)
+                                  result.success(ControlService.instance != null)
+                              }
+                              "nav" -> {
+                                  ControlService.instance?.global(call.argument<String>("action") ?: "")
+                                  result.success(ControlService.instance != null)
+                              }
                               "status" -> {
                                   val m = HashMap<String, Any>()
                                   m["running"] = CamService.running
@@ -995,6 +1094,7 @@ jobs:
 
               companion object {
                   private const val ENGINE_ID = "lancam_engine"
+                  private const val REQ_SCREEN = 7001
               }
           }
           EOF
@@ -1231,6 +1331,292 @@ jobs:
           }
           EOF
           grep -n "CamService\|BootReceiver" $M
+
+      - name: Add screen share + remote control (Android)
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          python3 - "$M" << 'PY'
+          import sys
+          p = sys.argv[1]
+          s = open(p, encoding='utf-8').read()
+          block = """    <service android:name=".ScreenService" android:exported="false" android:foregroundServiceType="mediaProjection" />
+              <service android:name=".ControlService" android:exported="true" android:label="LAN Cam" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                  <intent-filter>
+                      <action android:name="android.accessibilityservice.AccessibilityService" />
+                  </intent-filter>
+                  <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_service_config" />
+              </service>
+          </application>"""
+          s = s.replace("</application>", block, 1)
+          open(p, "w", encoding="utf-8").write(s)
+          PY
+          D=android/app/src/main/kotlin/com/example/lan_cam
+          R=android/app/src/main/res
+          mkdir -p $D $R/xml $R/values
+          cat > $R/xml/accessibility_service_config.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canPerformGestures="true"
+              android:notificationTimeout="100"
+              android:description="@string/lancam_a11y_desc" />
+          EOF
+          cat > $R/values/lancam_strings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="lancam_a11y_desc">يسمح لتطبيق LAN Cam بتنفيذ اللمس والتحكم عن بعد، فقط عند تفعيلك له</string>
+          </resources>
+          EOF
+          cat > $D/ScreenService.kt << 'EOF'
+          package com.example.lan_cam
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.os.IBinder
+          import android.os.Looper
+          import android.util.DisplayMetrics
+          import android.view.WindowManager
+          import io.flutter.plugin.common.EventChannel
+          import java.io.ByteArrayOutputStream
+
+          object ScreenBridge {
+              @Volatile var sink: EventChannel.EventSink? = null
+              @Volatile var channelFor: Any? = null
+              @Volatile var running = false
+              @Volatile var wanted = false
+              @Volatile var fps = 10
+              @Volatile var quality = 60
+              @Volatile var maxSide = 1280
+              @Volatile var realW = 0
+              @Volatile var realH = 0
+              @Volatile var lastError = ""
+              private val main = Handler(Looper.getMainLooper())
+
+              fun deliver(b: ByteArray) {
+                  val s = sink ?: return
+                  main.post {
+                      try { s.success(b) } catch (e: Exception) {}
+                  }
+              }
+          }
+
+          @Suppress("DEPRECATION")
+          class ScreenService : Service() {
+              private var projection: MediaProjection? = null
+              private var display: VirtualDisplay? = null
+              private var reader: ImageReader? = null
+              private var thread: HandlerThread? = null
+              private var lastSent = 0L
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val code = intent?.getIntExtra("code", 0) ?: 0
+                  val data: Intent? = if (Build.VERSION.SDK_INT >= 33) {
+                      intent?.getParcelableExtra("data", Intent::class.java)
+                  } else {
+                      intent?.getParcelableExtra<Intent>("data")
+                  }
+                  if (data == null || code == 0) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  cleanup()
+
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      nm.createNotificationChannel(
+                          NotificationChannel(CHANNEL, "LAN Cam screen", NotificationManager.IMPORTANCE_LOW)
+                      )
+                  }
+                  val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      Notification.Builder(this, CHANNEL)
+                  } else {
+                      Notification.Builder(this)
+                  }
+                  val n = b.setContentTitle("LAN Cam")
+                      .setContentText("مشاركة الشاشة شغالة")
+                      .setSmallIcon(android.R.drawable.ic_menu_view)
+                      .setOngoing(true)
+                      .build()
+                  try {
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          startForeground(2, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                      } else {
+                          startForeground(2, n)
+                      }
+                  } catch (e: Exception) {
+                      ScreenBridge.lastError = "screen fgs: " + e.toString()
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  try {
+                      val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      val proj = mpm.getMediaProjection(code, data)
+                      projection = proj
+                      val t = HandlerThread("lancam-screen")
+                      t.start()
+                      thread = t
+                      val h = Handler(t.looper)
+                      // required by Android 14+ before creating the virtual display
+                      proj.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() {
+                              stopSelf()
+                          }
+                      }, h)
+
+                      val dm = DisplayMetrics()
+                      val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                      wm.defaultDisplay.getRealMetrics(dm)
+                      ScreenBridge.realW = dm.widthPixels
+                      ScreenBridge.realH = dm.heightPixels
+                      val longSide = Math.max(dm.widthPixels, dm.heightPixels).toFloat()
+                      val scale = Math.min(1f, ScreenBridge.maxSide.toFloat() / longSide)
+                      val w = ((dm.widthPixels * scale).toInt() / 2) * 2
+                      val hh = ((dm.heightPixels * scale).toInt() / 2) * 2
+
+                      val r = ImageReader.newInstance(w, hh, PixelFormat.RGBA_8888, 2)
+                      reader = r
+                      display = proj.createVirtualDisplay(
+                          "lancam", w, hh, dm.densityDpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                          r.surface, null, h
+                      )
+                      r.setOnImageAvailableListener({ rd -> onFrame(rd, w, hh) }, h)
+                      ScreenBridge.running = true
+                      ScreenBridge.lastError = ""
+                  } catch (e: Exception) {
+                      ScreenBridge.lastError = "screen: " + e.toString()
+                      stopSelf()
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun onFrame(rd: ImageReader, w: Int, h: Int) {
+                  val img = (try { rd.acquireLatestImage() } catch (e: Exception) { null }) ?: return
+                  try {
+                      if (!ScreenBridge.wanted || ScreenBridge.sink == null) return
+                      val now = System.currentTimeMillis()
+                      if (now - lastSent < 1000L / Math.max(1, ScreenBridge.fps)) return
+                      lastSent = now
+                      val plane = img.planes[0]
+                      val pixelStride = plane.pixelStride
+                      val rowPadding = plane.rowStride - pixelStride * w
+                      val bmp = Bitmap.createBitmap(w + rowPadding / pixelStride, h, Bitmap.Config.ARGB_8888)
+                      bmp.copyPixelsFromBuffer(plane.buffer)
+                      val out = if (rowPadding == 0) bmp else Bitmap.createBitmap(bmp, 0, 0, w, h)
+                      val bos = ByteArrayOutputStream()
+                      out.compress(Bitmap.CompressFormat.JPEG, ScreenBridge.quality, bos)
+                      if (out !== bmp) out.recycle()
+                      bmp.recycle()
+                      ScreenBridge.deliver(bos.toByteArray())
+                  } catch (e: Exception) {
+                      ScreenBridge.lastError = "frame: " + e.toString()
+                  } finally {
+                      img.close()
+                  }
+              }
+
+              private fun cleanup() {
+                  ScreenBridge.running = false
+                  try { reader?.setOnImageAvailableListener(null, null) } catch (e: Exception) {}
+                  try { display?.release() } catch (e: Exception) {}
+                  try { reader?.close() } catch (e: Exception) {}
+                  try { projection?.stop() } catch (e: Exception) {}
+                  try { thread?.quitSafely() } catch (e: Exception) {}
+                  display = null
+                  reader = null
+                  projection = null
+                  thread = null
+              }
+
+              override fun onDestroy() {
+                  cleanup()
+                  super.onDestroy()
+              }
+
+              companion object {
+                  const val CHANNEL = "lancam_screen"
+              }
+          }
+          EOF
+          cat > $D/ControlService.kt << 'EOF'
+          package com.example.lan_cam
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.view.accessibility.AccessibilityEvent
+
+          // Lets the paired viewer tap / swipe / press Back-Home on this phone.
+          // Works only after the user enables it in Settings > Accessibility.
+          class ControlService : AccessibilityService() {
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  instance = this
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              override fun onDestroy() {
+                  instance = null
+                  super.onDestroy()
+              }
+
+              fun gesture(x1: Float, y1: Float, x2: Float, y2: Float, ms: Long) {
+                  val p = Path()
+                  p.moveTo(x1, y1)
+                  if (x1 != x2 || y1 != y2) p.lineTo(x2, y2)
+                  val d = Math.max(1L, ms)
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(p, 0, d))
+                      .build()
+                  dispatchGesture(g, null, null)
+              }
+
+              fun global(action: String) {
+                  val a = when (action) {
+                      "back" -> GLOBAL_ACTION_BACK
+                      "home" -> GLOBAL_ACTION_HOME
+                      "recents" -> GLOBAL_ACTION_RECENTS
+                      "notifications" -> GLOBAL_ACTION_NOTIFICATIONS
+                      else -> return
+                  }
+                  performGlobalAction(a)
+              }
+
+              companion object {
+                  @Volatile var instance: ControlService? = null
+              }
+          }
+          EOF
+          grep -n "ScreenService\|ControlService" $M
 
       - name: Force compileSdk 36 for ALL modules (app + plugins)
         run: |

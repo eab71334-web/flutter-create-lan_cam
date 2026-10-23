@@ -814,13 +814,31 @@ jobs:
             <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA"/>\
             <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>\
             <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\
-            <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>' \
+            <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>\
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>\
+            <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>\
+            <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>' \
             android/app/src/main/AndroidManifest.xml
 
       - name: Add background camera service (Android)
         run: |
           M=android/app/src/main/AndroidManifest.xml
-          sed -i 's#</application>#    <service android:name=".CamService" android:exported="false" android:foregroundServiceType="camera|microphone" android:stopWithTask="false" />\n    </application>#' $M
+          python3 - "$M" << 'PY'
+          import sys
+          p = sys.argv[1]
+          s = open(p, encoding='utf-8').read()
+          block = """    <service android:name=".CamService" android:exported="false" android:foregroundServiceType="camera|microphone|specialUse" android:stopWithTask="false">
+              <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="local_network_camera_standby" />
+          </service>
+          <receiver android:name=".BootReceiver" android:exported="true">
+              <intent-filter>
+                  <action android:name="android.intent.action.BOOT_COMPLETED" />
+              </intent-filter>
+          </receiver>
+          </application>"""
+          s = s.replace("</application>", block, 1)
+          open(p, "w", encoding="utf-8").write(s)
+          PY
           D=android/app/src/main/kotlin/com/example/lan_cam
           rm -f android/app/src/main/java/com/example/lan_cam/MainActivity.java
           mkdir -p $D
@@ -831,6 +849,7 @@ jobs:
           import android.content.Intent
           import android.net.Uri
           import android.os.Build
+          import android.os.Bundle
           import android.os.PowerManager
           import android.provider.Settings
           import io.flutter.embedding.android.FlutterActivity
@@ -839,6 +858,7 @@ jobs:
           import io.flutter.plugin.common.MethodChannel
 
           class MainActivity : FlutterActivity() {
+              private var pendingAutostart = false
 
               // One engine for the whole process: the Dart side (camera server)
               // keeps running after the screen closes or the app is swiped away.
@@ -854,23 +874,86 @@ jobs:
 
               override fun shouldDestroyEngineWithHost(): Boolean = false
 
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  handleLaunchIntent(intent)
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  handleLaunchIntent(intent)
+              }
+
+              // Started by the standby service when a viewer wakes the camera.
+              private fun handleLaunchIntent(i: Intent?) {
+                  if (i?.getBooleanExtra("autostart", false) == true) {
+                      pendingAutostart = true
+                      if (Build.VERSION.SDK_INT >= 27) {
+                          setShowWhenLocked(true)
+                          setTurnScreenOn(true)
+                      }
+                  }
+              }
+
+              private fun startSvc(action: String) {
+                  val i = Intent(applicationContext, CamService::class.java).setAction(action)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      applicationContext.startForegroundService(i)
+                  } else {
+                      applicationContext.startService(i)
+                  }
+              }
+
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "lancam/service")
                       .setMethodCallHandler { call, result ->
                           when (call.method) {
                               "start" -> {
-                                  val i = Intent(applicationContext, CamService::class.java)
-                                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                      applicationContext.startForegroundService(i)
-                                  } else {
-                                      applicationContext.startService(i)
-                                  }
+                                  startSvc(CamService.ACTION_CAMERA)
+                                  result.success(true)
+                              }
+                              "standby" -> {
+                                  startSvc(CamService.ACTION_STANDBY)
                                   result.success(true)
                               }
                               "stop" -> {
                                   applicationContext.stopService(Intent(applicationContext, CamService::class.java))
                                   result.success(true)
+                              }
+                              "config" -> {
+                                  val ed = getSharedPreferences("lancam", Context.MODE_PRIVATE).edit()
+                                  val always = call.argument<Boolean>("always")
+                                  val pin = call.argument<String>("pin")
+                                  if (always != null) ed.putBoolean("always", always)
+                                  if (pin != null) ed.putString("pin", pin)
+                                  ed.apply()
+                                  result.success(true)
+                              }
+                              "hasOverlay" -> {
+                                  result.success(if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) Settings.canDrawOverlays(this) else true)
+                              }
+                              "overlay" -> {
+                                  try {
+                                      startActivity(
+                                          Intent(
+                                              Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                              Uri.parse("package:" + packageName)
+                                          )
+                                      )
+                                      result.success(true)
+                                  } catch (e: Exception) {
+                                      result.success(false)
+                                  }
+                              }
+                              "toBack" -> {
+                                  moveTaskToBack(true)
+                                  result.success(true)
+                              }
+                              "consumeAutostart" -> {
+                                  val v = pendingAutostart
+                                  pendingAutostart = false
+                                  result.success(v)
                               }
                               "battery" -> {
                                   try {
@@ -915,21 +998,31 @@ jobs:
           import android.os.Build
           import android.os.IBinder
           import android.os.PowerManager
+          import java.net.InetSocketAddress
+          import java.net.ServerSocket
+          import java.net.Socket
 
           @Suppress("DEPRECATION")
           class CamService : Service() {
               private var wake: PowerManager.WakeLock? = null
               private var wifi: WifiManager.WifiLock? = null
+              private var listener: Thread? = null
+              private var server: ServerSocket? = null
 
               override fun onBind(intent: Intent?): IBinder? = null
 
+              private fun prefs() = getSharedPreferences("lancam", Context.MODE_PRIVATE)
+
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                  if (intent?.action == ACTION_STOP) {
+                  // null intent = restarted by the system after a kill -> standby mode
+                  val action = intent?.action ?: ACTION_STANDBY
+                  if (action == ACTION_STOP) {
                       stopForeground(true)
                       stopSelf()
                       android.os.Process.killProcess(android.os.Process.myPid())
                       return START_NOT_STICKY
                   }
+                  val camera = action == ACTION_CAMERA
 
                   val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -949,7 +1042,7 @@ jobs:
                       Notification.Builder(this)
                   }
                   val n = b.setContentTitle("LAN Cam")
-                      .setContentText("الكاميرا تعمل في الخلفية")
+                      .setContentText(if (camera) "الكاميرا تعمل في الخلفية" else "جاهزة للاتصال في أي وقت")
                       .setSmallIcon(android.R.drawable.ic_menu_camera)
                       .setContentIntent(openPi)
                       .setOngoing(true)
@@ -957,12 +1050,20 @@ jobs:
                       .build()
 
                   try {
-                      if (Build.VERSION.SDK_INT >= 30) {
-                          startForeground(
-                              1, n,
-                              ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
-                                  ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                          )
+                      val type: Int = if (camera) {
+                          var t = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
+                              ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                          if (Build.VERSION.SDK_INT >= 34) {
+                              t = t or ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                          }
+                          t
+                      } else if (Build.VERSION.SDK_INT >= 34) {
+                          ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                      } else {
+                          0
+                      }
+                      if (Build.VERSION.SDK_INT >= 30 && type != 0) {
+                          startForeground(1, n, type)
                       } else {
                           startForeground(1, n)
                       }
@@ -990,10 +1091,77 @@ jobs:
                           acquire()
                       }
                   }
-                  return START_NOT_STICKY
+
+                  val always = prefs().getBoolean("always", false)
+                  if (always) startListener() else stopListener()
+                  return if (always) START_STICKY else START_NOT_STICKY
+              }
+
+              // ── standby listener: a viewer sends "WAKE:<pin>" to open the app ──
+              private fun startListener() {
+                  if (listener != null) return
+                  listener = Thread {
+                      try {
+                          val ss = ServerSocket()
+                          ss.reuseAddress = true
+                          ss.bind(InetSocketAddress(WAKE_PORT))
+                          server = ss
+                          while (!Thread.currentThread().isInterrupted) {
+                              val c = ss.accept()
+                              handleClient(c)
+                          }
+                      } catch (e: Exception) {
+                      } finally {
+                          listener = null
+                      }
+                  }.apply {
+                      isDaemon = true
+                      start()
+                  }
+              }
+
+              private fun stopListener() {
+                  try { server?.close() } catch (e: Exception) {}
+                  listener?.interrupt()
+                  server = null
+                  listener = null
+              }
+
+              private fun handleClient(c: Socket) {
+                  try {
+                      c.soTimeout = 3000
+                      val line = c.getInputStream().bufferedReader().readLine()
+                      if (line.isNullOrEmpty()) return // plain port probe (network scan)
+                      val p = prefs()
+                      val pin = p.getString("pin", "") ?: ""
+                      val ok = p.getBoolean("always", false) && pin.isNotEmpty() && line.trim() == "WAKE:" + pin
+                      if (ok) {
+                          wakeApp()
+                          c.getOutputStream().write("OK\n".toByteArray())
+                      } else {
+                          Thread.sleep(1000) // slow down PIN guessing
+                          c.getOutputStream().write("DENIED\n".toByteArray())
+                      }
+                      c.getOutputStream().flush()
+                  } catch (e: Exception) {
+                  } finally {
+                      try { c.close() } catch (e: Exception) {}
+                  }
+              }
+
+              private fun wakeApp() {
+                  val i = packageManager.getLaunchIntentForPackage(packageName) ?: return
+                  i.addFlags(
+                      Intent.FLAG_ACTIVITY_NEW_TASK or
+                          Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                          Intent.FLAG_ACTIVITY_SINGLE_TOP
+                  )
+                  i.putExtra("autostart", true)
+                  try { startActivity(i) } catch (e: Exception) {}
               }
 
               override fun onDestroy() {
+                  stopListener()
                   try { wake?.release() } catch (e: Exception) {}
                   try { wifi?.release() } catch (e: Exception) {}
                   wake = null
@@ -1003,11 +1171,39 @@ jobs:
 
               companion object {
                   const val ACTION_STOP = "com.example.lan_cam.STOP"
+                  const val ACTION_CAMERA = "com.example.lan_cam.CAMERA"
+                  const val ACTION_STANDBY = "com.example.lan_cam.STANDBY"
                   const val CHANNEL = "lancam_service"
+                  const val WAKE_PORT = 8081
               }
           }
           EOF
-          grep -n "CamService" $M
+          cat > $D/BootReceiver.kt << 'EOF'
+          package com.example.lan_cam
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent?) {
+                  try {
+                      val always = context.getSharedPreferences("lancam", Context.MODE_PRIVATE)
+                          .getBoolean("always", false)
+                      if (!always) return
+                      val i = Intent(context, CamService::class.java).setAction(CamService.ACTION_STANDBY)
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          context.startForegroundService(i)
+                      } else {
+                          context.startService(i)
+                      }
+                  } catch (e: Exception) {
+                  }
+              }
+          }
+          EOF
+          grep -n "CamService\|BootReceiver" $M
 
       - name: Force compileSdk 36 for ALL modules (app + plugins)
         run: |

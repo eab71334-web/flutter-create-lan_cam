@@ -849,7 +849,10 @@ jobs:
           import android.app.Activity
           import android.content.Context
           import android.content.Intent
+          import android.content.IntentFilter
           import android.media.projection.MediaProjectionManager
+          import android.net.wifi.WifiManager
+          import android.os.BatteryManager
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
@@ -1087,6 +1090,23 @@ jobs:
                                       result.success(false)
                                   }
                               }
+                              "health" -> {
+                                  val m = HashMap<String, Any>()
+                                  try {
+                                      val bi = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                                      if (bi != null) {
+                                          val t = bi.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1)
+                                          if (t >= 0) m["temp"] = t / 10.0
+                                      }
+                                  } catch (e: Exception) {}
+                                  try {
+                                      val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                                      @Suppress("DEPRECATION")
+                                      val rssi = wm.connectionInfo?.rssi
+                                      if (rssi != null && rssi > -127) m["rssi"] = rssi
+                                  } catch (e: Exception) {}
+                                  result.success(m)
+                              }
                               else -> result.notImplemented()
                           }
                       }
@@ -1123,6 +1143,8 @@ jobs:
               private var wifi: WifiManager.WifiLock? = null
               private var listener: Thread? = null
               private var server: ServerSocket? = null
+              private var wakeFails = 0
+              private var wakeLockUntil = 0L
               @Volatile private var stopping = false
 
               override fun onBind(intent: Intent?): IBinder? = null
@@ -1257,11 +1279,21 @@ jobs:
                       if (line.isNullOrEmpty()) return // plain port probe (network scan)
                       val p = prefs()
                       val pin = p.getString("pin", "") ?: ""
-                      val ok = p.getBoolean("always", false) && pin.isNotEmpty() && line.trim() == "WAKE:" + pin
+                      val now = System.currentTimeMillis()
+                      val locked = now < wakeLockUntil
+                      val ok = !locked && p.getBoolean("always", false) && pin.isNotEmpty() && line.trim() == "WAKE:" + pin
                       if (ok) {
+                          wakeFails = 0
                           wakeApp()
                           c.getOutputStream().write("OK\n".toByteArray())
                       } else {
+                          if (!locked) {
+                              wakeFails++
+                              if (wakeFails >= 5) {
+                                  wakeLockUntil = now + 300000L
+                                  wakeFails = 0
+                              }
+                          }
                           Thread.sleep(1000) // slow down PIN guessing
                           c.getOutputStream().write("DENIED\n".toByteArray())
                       }
@@ -2524,9 +2556,14 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :NSCameraUsageDescription string Camera is used for streaming" $P
           /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string Microphone is used for streaming" $P
           /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string Used to connect to the camera on your local network" $P
+          /usr/libexec/PlistBuddy -c "Add :NSPhotoLibraryAddUsageDescription string Used to save snapshots from the camera" $P
+          /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" $P
+          /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" $P
 
       - name: Set iOS deployment target
-        run: sed -i '' -E "s/^#? ?platform :ios, '[0-9.]+'/platform :ios, '13.0'/" ios/Podfile
+        run: |
+          sed -i '' -E "s/^#? ?platform :ios, '[0-9.]+'/platform :ios, '15.5'/" ios/Podfile
+          sed -i '' -E "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = 15.5;/g" ios/Runner.xcodeproj/project.pbxproj
 
       - run: flutter pub get
 

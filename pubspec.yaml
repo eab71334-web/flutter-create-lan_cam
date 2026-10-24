@@ -13,6 +13,10 @@ dependencies:
   path_provider: ^2.1.0
   permission_handler: ^11.3.0
   wakelock_plus: ^1.2.8
+  qr_flutter: ^4.1.0
+  mobile_scanner: ^6.0.2
+  battery_plus: ^6.2.0
+  gal: ^2.3.0
 
 flutter:
   uses-material-design: true

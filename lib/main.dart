@@ -1,3 +1,4 @@
+```dart
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -6,16 +7,22 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:battery_plus/battery_plus.dart' show Battery, BatteryState;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:gal/gal.dart' show Gal;
+import 'package:mobile_scanner/mobile_scanner.dart'
+    show BarcodeCapture, BarcodeFormat, MobileScanner, MobileScannerController;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:qr_flutter/qr_flutter.dart' show QrImageView, QrVersions;
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 const int kPort = 8080;
 const int kWakePort = 8081; // standby listener (camera app closed)
-const Map<String, dynamic> kPcConfig = {
+// LAN only by default; applyNetConfig() adds STUN in "outside the LAN" mode.
+Map<String, dynamic> kPcConfig = {
   'sdpSemantics': 'unified-plan',
-  'iceServers': <Map<String, dynamic>>[], // LAN only
+  'iceServers': <Map<String, dynamic>>[],
 };
 
 const MethodChannel _svc = MethodChannel('lancam/service');
@@ -159,6 +166,239 @@ Future<void> waitIceGathered(RTCPeerConnection pc) async {
         !c.isCompleted) c.complete();
   };
   await c.future.timeout(const Duration(seconds: 3), onTimeout: () {});
+}
+
+/// Network options. STUN servers are added only in "outside the LAN" mode.
+Future<void> applyNetConfig() async {
+  final s = await loadSettings();
+  final wan = (s['wan'] as bool?) ?? false;
+  kPcConfig = {
+    'sdpSemantics': 'unified-plan',
+    'iceServers': wan
+        ? <Map<String, dynamic>>[
+            {'urls': 'stun:stun.l.google.com:19302'},
+            {'urls': 'stun:stun1.l.google.com:19302'},
+          ]
+        : <Map<String, dynamic>>[],
+  };
+}
+
+double numOf(dynamic v) => v is num ? v.toDouble() : (double.tryParse('$v') ?? 0);
+
+String two(int n) => n.toString().padLeft(2, '0');
+
+String fmtStamp(DateTime t) =>
+    '${t.year}-${two(t.month)}-${two(t.day)}  ${two(t.hour)}:${two(t.minute)}:${two(t.second)}';
+
+String fmtFile(DateTime t) =>
+    '${t.year}-${two(t.month)}-${two(t.day)}_${two(t.hour)}-${two(t.minute)}-${two(t.second)}';
+
+String srtTime(int ms) {
+  final h = ms ~/ 3600000;
+  final m = (ms ~/ 60000) % 60;
+  final s = (ms ~/ 1000) % 60;
+  final r = ms % 1000;
+  return '${two(h)}:${two(m)}:${two(s)},${r.toString().padLeft(3, '0')}';
+}
+
+/// Every IPv4 address of this phone with its interface name (Wi-Fi, VPN...).
+Future<List<MapEntry<String, String>>> allIps() async {
+  final out = <MapEntry<String, String>>[];
+  try {
+    for (final i
+        in await NetworkInterface.list(type: InternetAddressType.IPv4)) {
+      for (final a in i.addresses) {
+        if (a.isLoopback || a.isLinkLocal) continue;
+        out.add(MapEntry(i.name, a.address));
+      }
+    }
+  } catch (_) {}
+  return out;
+}
+
+Future<bool> portOpen(String ip, int port) async {
+  try {
+    final s = await Socket.connect(ip, port,
+        timeout: const Duration(milliseconds: 1200));
+    s.destroy();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/// 'ok' | 'unreachable' | 'denied' | 'noreply'
+Future<String> wakeCamera(String ip, String pin) async {
+  Socket s;
+  try {
+    s = await Socket.connect(ip, kWakePort,
+        timeout: const Duration(seconds: 3));
+  } catch (_) {
+    return 'unreachable';
+  }
+  try {
+    s.write('WAKE:$pin\n');
+    await s.flush();
+    final reply = await s
+        .cast<List<int>>()
+        .transform(utf8.decoder)
+        .join()
+        .timeout(const Duration(seconds: 5), onTimeout: () => '');
+    s.destroy();
+    final r = reply.trim();
+    if (r == 'OK') return 'ok';
+    if (r == 'DENIED') return 'denied';
+    return 'noreply';
+  } catch (_) {
+    return 'noreply';
+  }
+}
+
+const List<String> kQualityNames = [
+  'عالية',
+  'جيدة',
+  'متوسطة',
+  'منخفضة',
+  'دنيا'
+];
+
+/// Date + time stamp shown over the video.
+class ClockStamp extends StatelessWidget {
+  const ClockStamp({super.key, required this.time});
+  final ValueListenable<DateTime> time;
+  @override
+  Widget build(BuildContext context) => ValueListenableBuilder<DateTime>(
+        valueListenable: time,
+        builder: (_, t, __) => Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+          decoration: BoxDecoration(
+            color: const Color(0x99000000),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Text(fmtStamp(t),
+              textDirection: TextDirection.ltr,
+              style: const TextStyle(
+                  fontSize: 11, color: Colors.white, letterSpacing: 0.4)),
+        ),
+      );
+}
+
+/// Camera health (battery / temperature / Wi-Fi) + link quality chips.
+class HealthBar extends StatelessWidget {
+  const HealthBar({super.key, required this.h, this.link = ''});
+  final Map h;
+  final String link; // '', good, fair, poor (measured on the viewer)
+
+  Widget _chip(IconData icon, String text, Color c) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+        decoration: BoxDecoration(
+          color: const Color(0x99000000),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Icon(icon, size: 13, color: c),
+          const SizedBox(width: 4),
+          Text(text,
+              textDirection: TextDirection.ltr,
+              style: const TextStyle(fontSize: 11, color: Colors.white)),
+        ]),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final bat = h['bat'];
+    final chg = h['chg'] == true;
+    final temp = h['temp'];
+    final rssi = h['rssi'];
+    final q = h['q'];
+    final chips = <Widget>[];
+    if (bat is num) {
+      final low = bat <= 20 && !chg;
+      chips.add(_chip(
+          chg
+              ? Icons.battery_charging_full_rounded
+              : (low ? Icons.battery_alert_rounded : Icons.battery_full_rounded),
+          '${bat.toInt()}%',
+          low ? kRed : (chg ? kGreen : Colors.white70)));
+    }
+    if (temp is num) {
+      chips.add(_chip(Icons.thermostat_rounded, '${temp.toStringAsFixed(0)}°',
+          temp >= 45 ? kRed : (temp >= 41 ? Colors.amber : Colors.white70)));
+    }
+    if (rssi is num) {
+      chips.add(_chip(Icons.wifi_rounded, '${rssi.toInt()} dBm',
+          rssi <= -80 ? kRed : (rssi <= -70 ? Colors.amber : kGreen)));
+    }
+    if (link.isNotEmpty) {
+      final c = link == 'good'
+          ? kGreen
+          : (link == 'fair' ? Colors.amber : kRed);
+      final t = link == 'good' ? 'اتصال قوي' : (link == 'fair' ? 'متوسط' : 'ضعيف');
+      chips.add(_chip(Icons.network_check_rounded, t, c));
+    }
+    if (q is num && q > 0) {
+      chips.add(_chip(Icons.speed_rounded,
+          'جودة تلقائية: ${kQualityNames[q.toInt().clamp(0, 4).toInt()]}', Colors.amber));
+    }
+    if (chips.isEmpty) return const SizedBox.shrink();
+    return Wrap(spacing: 5, runSpacing: 5, children: chips);
+  }
+}
+
+/// Scans a LAN Cam pairing QR code. Pops with the raw text.
+class QrScanPage extends StatefulWidget {
+  const QrScanPage({super.key});
+  @override
+  State<QrScanPage> createState() => _QrScanPageState();
+}
+
+class _QrScanPageState extends State<QrScanPage> {
+  final _c = MobileScannerController(formats: const [BarcodeFormat.qrCode]);
+  bool _done = false;
+
+  void _onDetect(BarcodeCapture cap) {
+    if (_done) return;
+    for (final b in cap.barcodes) {
+      final v = b.rawValue;
+      if (v != null && v.startsWith('LANCAM|')) {
+        _done = true;
+        Navigator.pop(context, v);
+        return;
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('امسح رمز QR من شاشة الكاميرا')),
+        body: Stack(fit: StackFit.expand, children: [
+          MobileScanner(controller: _c, onDetect: _onDetect),
+          Center(
+            child: Container(
+              width: 240,
+              height: 240,
+              decoration: BoxDecoration(
+                border: Border.all(color: kAccent, width: 3),
+                borderRadius: BorderRadius.circular(22),
+              ),
+            ),
+          ),
+          const Positioned(
+            left: 0,
+            right: 0,
+            bottom: 40,
+            child: Text('على جهاز الكاميرا اضغط "عرض رمز QR"',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.white70)),
+          ),
+        ]),
+      );
 }
 
 // ───────────────────────────── Widgets ─────────────────────────────
@@ -577,6 +817,16 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
                     ),
                     const SizedBox(height: 14),
                     ModeCard(
+                      icon: Icons.grid_view_rounded,
+                      title: 'عدة كاميرات',
+                      subtitle: 'شاهد حتى 4 كاميرات معاً في شبكة 2×2',
+                      color: const Color(0xFFF472B6),
+                      tint: const Color(0x26F472B6),
+                      onTap: () => Navigator.push(context,
+                          MaterialPageRoute(builder: (_) => const MultiViewPage())),
+                    ),
+                    const SizedBox(height: 14),
+                    ModeCard(
                       icon: Icons.phone_android_rounded,
                       title: 'شاشة الهاتف',
                       subtitle: 'اعرض شاشة هاتف آخر وتحكم به عن بعد',
@@ -608,6 +858,9 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
                           'صوت ثنائي الاتجاه',
                           'تسجيل',
                           'رمز حماية PIN',
+                          'ربط QR',
+                          'رؤية ليلية',
+                          'إعادة اتصال تلقائية',
                         ])
                           Container(
                             padding: const EdgeInsets.symmetric(
@@ -720,6 +973,30 @@ class _SettingsPageState extends State<SettingsPage> {
             _chips<bool>('الدخول للشاشة العريضة تلقائياً', 'autoWide', true,
                 [true, false], ['نعم', 'لا']),
           ]),
+          _group('المدى والشبكة', Icons.wifi_tethering_rounded, [
+            _chips<bool>('وضع المدى البعيد (جودة أقل = ثبات أكثر)', 'range', false,
+                [false, true], ['إيقاف', 'تشغيل']),
+            _chips<bool>('الاتصال من خارج الشبكة المحلية (STUN)', 'wan', false,
+                [false, true], ['إيقاف', 'تشغيل']),
+            _chips<bool>('ختم التاريخ والوقت على العرض', 'clock', true,
+                [true, false], ['نعم', 'لا']),
+            Container(
+              margin: const EdgeInsets.only(bottom: 14),
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: kBg,
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: const Text(
+                'لزيادة المسافة:\n'
+                '• استخدم واي فاي 2.4GHz (أبعد من 5GHz).\n'
+                '• قرّب الراوتر أو أضف مقوّي إشارة (Mesh/Repeater).\n'
+                '• إن كانت الإشارة ضعيفة فعّل "المدى البعيد" أو اترك الجودة التلقائية تعمل.\n'
+                '• للمشاهدة من خارج البيت: ثبّت Tailscale (مجاني) على الهاتفين واكتب عنوان 100.x الظاهر في الكاميرا. لا تفتح المنافذ 8080/8081 في الراوتر.',
+                style: TextStyle(fontSize: 12, color: Colors.white70, height: 1.6),
+              ),
+            ),
+          ]),
           _group('مشاركة الشاشة والتحكم', Icons.phone_android_rounded, [
             _chips<int>('الإطارات', 'sfps', 10, [5, 10, 15], ['5', '10', '15']),
             _chips<int>('جودة الصورة', 'squality', 60, [40, 60, 80],
@@ -766,6 +1043,31 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   int _screenH = 0;
   int _kbps = 0;
   int _fps = 30;
+  // health / adaptive quality / pairing
+  final _battery = Battery();
+  Timer? _healthTimer;
+  Timer? _adaptTimer;
+  Timer? _clockTimer;
+  Map<String, dynamic> _myHealth = {};
+  final _now = ValueNotifier<DateTime>(DateTime.now());
+  static const List<List<num>> _levels = [
+    [0, 1.0],
+    [1500, 1.0],
+    [800, 1.5],
+    [400, 2.0],
+    [200, 3.0],
+  ];
+  int _level = 0;
+  int _good = 0;
+  bool _throttled = false;
+  bool _range = false;
+  bool _clockOn = true;
+  List<MapEntry<String, String>> _ips = [];
+  final Map<String, List<DateTime>> _fails = {};
+  IOSink? _srt;
+  Timer? _srtTimer;
+  int _srtN = 0;
+  DateTime? _recStart;
 
   @override
   void initState() {
@@ -781,6 +1083,10 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     _pin = (s['campin'] as String?) ?? _newPin();
     await saveSettings({'campin': _pin});
     _always = (s['always'] as bool?) ?? false;
+    _range = (s['range'] as bool?) ?? false;
+    _clockOn = (s['clock'] as bool?) ?? true;
+    _level = _range ? 3 : 0;
+    await applyNetConfig();
     if (Platform.isAndroid) {
       try {
         await _svc.invokeMethod('config', {'always': _always, 'pin': _pin});
@@ -830,6 +1136,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     }
     _local.srcObject = _stream;
     _ip = await localIp() ?? '...';
+    _ips = await allIps();
 
     // Android: run as a foreground service so it keeps working in the
     // background / with the screen off / after the app is swiped away.
@@ -848,6 +1155,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
           ..close();
         return;
       }
+      final remote = req.connectionInfo?.remoteAddress.address ?? '?';
       final ws = await WebSocketTransformer.upgrade(req);
       var authed = false;
       ws.listen((m) async {
@@ -855,11 +1163,18 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         final d = jsonDecode(m);
         switch (d['type']) {
           case 'offer':
+            if (_locked(remote)) {
+              ws.add(jsonEncode({'type': 'locked'}));
+              await ws.close();
+              return;
+            }
             if ((d['pin'] ?? '') != _pin) {
+              _fails.putIfAbsent(remote, () => []).add(DateTime.now());
               ws.add(jsonEncode({'type': 'denied'}));
               await ws.close();
               return;
             }
+            _fails.remove(remote);
             authed = true;
             _ws = ws;
             await _answer(ws, d['sdp'] as String);
@@ -872,11 +1187,18 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
             if (authed) await _cmd(d);
             break;
           case 'screen':
+            if (_locked(remote)) {
+              ws.add(jsonEncode({'type': 'locked'}));
+              await ws.close();
+              return;
+            }
             if ((d['pin'] ?? '') != _pin) {
+              _fails.putIfAbsent(remote, () => []).add(DateTime.now());
               ws.add(jsonEncode({'type': 'denied'}));
               await ws.close();
               return;
             }
+            _fails.remove(remote);
             authed = true;
             await _attachScreen(ws);
             break;
@@ -892,6 +1214,12 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     _refreshDiag();
     _diagTimer =
         Timer.periodic(const Duration(seconds: 3), (_) => _refreshDiag());
+    _healthTimer =
+        Timer.periodic(const Duration(seconds: 4), (_) => _sendHealth());
+    _adaptTimer = Timer.periodic(const Duration(seconds: 3), (_) => _adapt());
+    _clockTimer = Timer.periodic(
+        const Duration(seconds: 1), (_) => _now.value = DateTime.now());
+    _sendHealth();
 
     // Woken remotely while the app was closed: hide again once we are live.
     if (widget.autoMinimize && Platform.isAndroid) {
@@ -924,9 +1252,15 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     ws.add(jsonEncode({'type': 'answer', 'sdp': l!.sdp}));
   }
 
-  /// Apply the max bitrate / fps from the settings to the video sender.
+  /// Apply bitrate / fps / resolution scale (user settings + adaptive level).
   Future<void> _applyEncoding(RTCPeerConnection pc) async {
-    if (_kbps <= 0) return;
+    final lv = _levels[_level];
+    final lk = lv[0].toInt();
+    var cap = _kbps;
+    if (lk > 0) cap = cap > 0 ? min(cap, lk) : lk;
+    final scale = lv[1].toDouble();
+    final fps = _level >= 3 ? min(_fps, 15) : _fps;
+    if (cap <= 0 && scale == 1.0 && !_throttled) return;
     try {
       final senders = await pc.getSenders();
       for (final snd in senders) {
@@ -935,12 +1269,179 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         final encs = p.encodings as List?;
         if (encs == null || encs.isEmpty) continue;
         for (final e in encs) {
-          (e as dynamic).maxBitrate = _kbps * 1000;
-          (e as dynamic).maxFramerate = _fps;
+          try {
+            (e as dynamic).maxBitrate = cap > 0 ? cap * 1000 : null;
+          } catch (_) {}
+          try {
+            (e as dynamic).maxFramerate = fps;
+          } catch (_) {}
+          try {
+            (e as dynamic).scaleResolutionDownBy = scale;
+          } catch (_) {}
         }
         await (snd as dynamic).setParameters(p);
       }
+      _throttled = _level > 0;
     } catch (_) {}
+  }
+
+  bool _locked(String ip) {
+    final l = _fails[ip];
+    if (l == null) return false;
+    l.removeWhere(
+        (t) => DateTime.now().difference(t) > const Duration(minutes: 5));
+    return l.length >= 5;
+  }
+
+  /// Weak link -> lower quality automatically; good link -> step back up.
+  Future<void> _adapt() async {
+    final pc = _pc;
+    if (pc == null || _ws == null) return;
+    if (pc.connectionState !=
+        RTCPeerConnectionState.RTCPeerConnectionStateConnected) return;
+    var loss = 0.0;
+    var rtt = 0.0;
+    try {
+      for (final r in await pc.getStats()) {
+        final v = r.values;
+        if (r.type == 'remote-inbound-rtp') {
+          if ('${v['kind'] ?? v['mediaType']}' == 'audio') continue;
+          loss = max(loss, numOf(v['fractionLost']));
+          rtt = max(rtt, numOf(v['roundTripTime']));
+        } else if (r.type == 'candidate-pair' && '${v['nominated']}' == 'true') {
+          rtt = max(rtt, numOf(v['currentRoundTripTime']));
+        }
+      }
+    } catch (_) {
+      return;
+    }
+    final floor = _range ? 3 : 0;
+    final before = _level;
+    if (loss > 0.06 || rtt > 0.45) {
+      _good = 0;
+      if (_level < 4) _level++;
+    } else if (loss < 0.02 && rtt < 0.2) {
+      _good++;
+      if (_good >= 4 && _level > floor) {
+        _level--;
+        _good = 0;
+      }
+    } else {
+      _good = 0;
+    }
+    if (_level < floor) _level = floor;
+    if (_level != before) await _applyEncoding(pc);
+  }
+
+  /// Battery / temperature / Wi-Fi strength -> viewer (every 4 s).
+  Future<void> _sendHealth() async {
+    final m = <String, dynamic>{
+      'ts': DateTime.now().millisecondsSinceEpoch,
+      'q': _level,
+      'range': _range,
+    };
+    try {
+      m['bat'] = await _battery.batteryLevel;
+      final st = await _battery.batteryState;
+      m['chg'] = st == BatteryState.charging || st == BatteryState.full;
+    } catch (_) {}
+    if (Platform.isAndroid) {
+      try {
+        final h = await _svc.invokeMethod<Map>('health');
+        if (h != null) {
+          if (h['temp'] != null) m['temp'] = h['temp'];
+          if (h['rssi'] != null) m['rssi'] = h['rssi'];
+        }
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    setState(() => _myHealth = m);
+    try {
+      _ws?.add(jsonEncode({'type': 'health', ...m}));
+    } catch (_) {}
+  }
+
+  void _showQr() {
+    final cands = _ips.isEmpty ? [MapEntry('wifi', _ip)] : _ips;
+    var sel = cands.indexWhere((e) => e.value == _ip);
+    if (sel < 0) sel = 0;
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setM) => AlertDialog(
+          backgroundColor: kSurface,
+          title: const Text('ربط سريع عبر QR'),
+          content: Column(mainAxisSize: MainAxisSize.min, children: [
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: QrImageView(
+                data: 'LANCAM|${cands[sel].value}|$kPort|$_pin',
+                version: QrVersions.auto,
+                size: 210,
+                backgroundColor: Colors.white,
+              ),
+            ),
+            const SizedBox(height: 10),
+            Text('${cands[sel].value}  (${cands[sel].key})',
+                textDirection: TextDirection.ltr,
+                style: const TextStyle(fontSize: 12, color: Colors.white70)),
+            if (cands.length > 1)
+              Wrap(spacing: 6, children: [
+                for (var i = 0; i < cands.length; i++)
+                  ChoiceChip(
+                    label: Text(cands[i].value,
+                        style: const TextStyle(fontSize: 11)),
+                    selected: i == sel,
+                    onSelected: (_) => setM(() => sel = i),
+                  ),
+              ]),
+            const SizedBox(height: 8),
+            const Text('الرمز يحتوي على الـ PIN — لا تعرضه لأحد لا تثق به.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 11, color: Colors.amber)),
+          ]),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx), child: const Text('إغلاق')),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _startSrt(String path, DateTime t0) {
+    try {
+      _recStart = t0;
+      _srtN = 0;
+      _srt = File(path).openWrite(encoding: utf8);
+      _srtTimer =
+          Timer.periodic(const Duration(seconds: 1), (_) => _srtTick());
+      _srtTick();
+    } catch (_) {}
+  }
+
+  void _srtTick() {
+    final w = _srt;
+    final t0 = _recStart;
+    if (w == null || t0 == null) return;
+    final now = DateTime.now();
+    final ms = now.difference(t0).inMilliseconds;
+    _srtN++;
+    w.write('$_srtN\n${srtTime(ms)} --> ${srtTime(ms + 1000)}\n${fmtStamp(now)}\n\n');
+  }
+
+  Future<void> _stopSrt() async {
+    _srtTimer?.cancel();
+    _srtTimer = null;
+    try {
+      await _srt?.flush();
+      await _srt?.close();
+    } catch (_) {}
+    _srt = null;
   }
 
   // ── phone screen sharing + remote control (Android host) ──
@@ -1074,6 +1575,15 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
 
   /// Remote controls from the viewer: switch camera / flashlight.
   Future<void> _cmd(Map<String, dynamic> d) async {
+    if (d['cmd'] == 'range') {
+      _range = d['on'] == true;
+      saveSettings({'range': _range});
+      if (_range && _level < 3) _level = 3;
+      final pc = _pc;
+      if (pc != null) await _applyEncoding(pc);
+      if (mounted) setState(() {});
+      return;
+    }
     final tracks = _stream?.getVideoTracks();
     if (tracks == null || tracks.isEmpty) return;
     final v = tracks.first;
@@ -1105,16 +1615,20 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     if (!Platform.isAndroid) return; // flutter_webrtc recorder: Android only
     if (_recording) {
       await _rec?.stop();
+      await _stopSrt();
       if (mounted) setState(() => _recording = false);
       return;
     }
     final dir = await getExternalStorageDirectory() ??
         await getApplicationDocumentsDirectory();
-    final path = '${dir.path}/cam_${DateTime.now().millisecondsSinceEpoch}.mp4';
+    final t0 = DateTime.now();
+    final path = '${dir.path}/cam_${fmtFile(t0)}.mp4';
     _rec = MediaRecorder();
     await _rec!.start(path,
         videoTrack: _stream!.getVideoTracks().first,
         audioChannel: RecorderAudioChannel.INPUT);
+    // subtitle file with the date/time (players show it next to the video)
+    _startSrt(path.replaceFirst(RegExp(r'\.mp4$'), '.srt'), t0);
     if (mounted) setState(() => _recording = true);
   }
 
@@ -1122,6 +1636,11 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   void dispose() {
     CameraPage.active = false;
     _diagTimer?.cancel();
+    _healthTimer?.cancel();
+    _adaptTimer?.cancel();
+    _clockTimer?.cancel();
+    _now.dispose();
+    _stopSrt();
     _screenSub?.cancel();
     if (Platform.isAndroid) {
       _svc.invokeMethod('screenStop').catchError((_) {});
@@ -1283,7 +1802,27 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
                     style: const TextStyle(fontSize: 13, color: Colors.white70)),
               ),
             ]),
-            const SizedBox(height: 12),
+            const SizedBox(height: 10),
+            if (_myHealth.isNotEmpty) HealthBar(h: _myHealth),
+            if (_myHealth.isNotEmpty) const SizedBox(height: 10),
+            for (final e in _ips.where((e) => e.value != _ip))
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Text('${e.key}: ${e.value}  (شبكة أخرى / VPN)',
+                    textDirection: TextDirection.ltr,
+                    style: const TextStyle(fontSize: 11, color: Colors.white54)),
+              ),
+            OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(
+                minimumSize: const Size.fromHeight(40),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14)),
+              ),
+              icon: const Icon(Icons.qr_code_2_rounded, size: 20),
+              label: const Text('عرض رمز QR للربط'),
+              onPressed: _showQr,
+            ),
+            const SizedBox(height: 10),
             if (Platform.isAndroid)
               Container(
                 margin: const EdgeInsets.only(bottom: 10),
@@ -1339,6 +1878,8 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         child: Stack(fit: StackFit.expand, children: [
           Container(color: Colors.black),
           RTCVideoView(_local),
+          if (_clockOn)
+            Positioned(left: 10, bottom: 10, child: ClockStamp(time: _now)),
           Positioned(
             top: 10,
             right: 10,
@@ -1386,8 +1927,17 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
 
 // ───────────────────────────── Viewer ─────────────────────────────
 class ViewerPage extends StatefulWidget {
-  const ViewerPage({super.key, this.screen = false});
+  const ViewerPage({
+    super.key,
+    this.screen = false,
+    this.initialIp,
+    this.initialPin,
+    this.autoConnect = false,
+  });
   final bool screen; // true = view + control another phone's screen
+  final String? initialIp;
+  final String? initialPin;
+  final bool autoConnect;
   @override
   State<ViewerPage> createState() => _ViewerPageState();
 }
@@ -1422,6 +1972,28 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
   Offset? _panStart;
   Offset? _panLast;
   DateTime _panT = DateTime.now();
+  // health / link / auto-reconnect / night view / zoom
+  Map<String, dynamic> _health = {};
+  String _link = '';
+  Timer? _statsTimer;
+  Timer? _retryTimer;
+  Timer? _lostTimer;
+  Timer? _clockTimer;
+  final _now = ValueNotifier<DateTime>(DateTime.now());
+  int _camOffsetMs = 0;
+  bool _wantLive = false;
+  bool _connecting = false;
+  bool _wasLive = false;
+  int _retryN = 0;
+  int _night = 0;
+  bool _clockOn = true;
+  bool _range = false;
+  int _prevLost = 0;
+  int _prevRecv = 0;
+  bool _alertedBat20 = false;
+  bool _alertedBat10 = false;
+  bool _alertedTemp = false;
+  final _tc = TransformationController();
 
   RTCVideoViewObjectFit get _fit => _fitCover
       ? RTCVideoViewObjectFit.RTCVideoViewObjectFitCover
@@ -1433,14 +2005,28 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     WakelockPlus.enable();
     _remote.initialize();
+    _clockTimer = Timer.periodic(
+        const Duration(seconds: 1),
+        (_) => _now.value =
+            DateTime.now().add(Duration(milliseconds: _camOffsetMs)));
+    _statsTimer =
+        Timer.periodic(const Duration(seconds: 3), (_) => _pollStats());
     loadSettings().then((s) {
       if (!mounted) return;
-      _ipCtl.text = (s['ip'] as String?) ?? '';
-      _pinCtl.text = (s['pin'] as String?) ?? '';
+      _ipCtl.text = widget.initialIp ?? (s['ip'] as String?) ?? '';
+      _pinCtl.text = widget.initialPin ?? (s['pin'] as String?) ?? '';
       setState(() {
         _fitCover = (s['fit'] as String?) == 'cover';
         _autoWide = (s['autoWide'] as bool?) ?? true;
+        _night = (s['night'] as int?) ?? 0;
+        _clockOn = (s['clock'] as bool?) ?? true;
+        _range = (s['range'] as bool?) ?? false;
       });
+      if (widget.autoConnect && widget.initialIp != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _connect();
+        });
+      }
     });
   }
 
@@ -1504,36 +2090,86 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
     if (mounted) setState(() => _wide = w);
   }
 
-  Future<void> _connect() async {
-    FocusScope.of(context).unfocus();
+  void _scheduleRetry([String? why]) {
+    if (!_wantLive || _denied || !mounted) return;
+    if (_retryTimer?.isActive == true) return;
+    _retryN++;
+    final secs = min(10, 1 + _retryN * 2);
+    setState(() {
+      _isConnected = false;
+      _status = '${why ?? 'انقطع الاتصال'} — إعادة المحاولة بعد $secs ث ($_retryN)';
+    });
+    _retryTimer = Timer(Duration(seconds: secs), () {
+      if (mounted && _wantLive && !_denied) _connect(retry: true);
+    });
+  }
+
+  void _stopRetry() {
+    _wantLive = false;
+    _retryTimer?.cancel();
+    _lostTimer?.cancel();
+    setState(() => _status = 'تم إيقاف المحاولة');
+  }
+
+  /// The link dropped after having been live: alert, then retry.
+  void _onLost() {
+    if (!_wantLive || _denied || !mounted) return;
+    if (_wasLive) {
+      _wasLive = false;
+      _alert('انقطع الاتصال بالكاميرا — جاري إعادة الاتصال');
+    }
+    final p = _pc;
+    final w = _ws;
+    _pc = null;
+    _ws = null;
+    p?.close();
+    w?.close();
+    _scheduleRetry();
+  }
+
+  Future<void> _connect({bool retry = false}) async {
+    if (_connecting || !mounted) return;
+    if (!retry) FocusScope.of(context).unfocus();
     final ip = _ipCtl.text.trim();
     if (ip.isEmpty) {
       _snack('اكتب IP الكاميرا أو اضغط بحث');
       return;
     }
+    _connecting = true;
     saveSettings({'ip': ip, 'pin': _pinCtl.text});
     _denied = false;
+    _wantLive = true;
+    _retryTimer?.cancel();
     try {
-      setState(() => _status = 'جاري الاتصال...');
+      await applyNetConfig();
+      if (mounted) {
+        setState(() => _status =
+            retry ? 'إعادة الاتصال ($_retryN)...' : 'جاري الاتصال...');
+      }
       if (!await _portOpen(ip, kPort)) {
         // camera app is closed: wake it (standby listener on the camera phone)
-        setState(() => _status = 'الكاميرا مغلقة — جاري إيقاظها...');
+        if (mounted) setState(() => _status = 'الكاميرا مغلقة — جاري إيقاظها...');
         final woke = await _wakeCamera(ip, _pinCtl.text);
         if (woke != 'ok') throw 'wake-$woke';
         var up = false;
-        for (var i = 0; i < 25 && !up; i++) {
+        for (var i = 0; i < 25 && !up && _wantLive; i++) {
           await Future.delayed(const Duration(seconds: 1));
           up = await _portOpen(ip, kPort);
         }
         if (!up) throw 'wake-timeout';
         if (mounted) setState(() => _status = 'جاري الاتصال...');
       }
+      if (!mounted || !_wantLive) return;
       if (widget.screen) {
         await _connectScreen(ip);
         return;
       }
-      await _pc?.close();
-      _ws?.close();
+      final oldPc = _pc;
+      final oldWs = _ws;
+      _pc = null;
+      _ws = null;
+      await oldPc?.close();
+      oldWs?.close();
       final ws = _ws = await WebSocket.connect('ws://$ip:$kPort')
           .timeout(const Duration(seconds: 5));
 
@@ -1543,7 +2179,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
           _mic = await navigator.mediaDevices
               .getUserMedia({'audio': true, 'video': false});
           _micTrack = _mic!.getAudioTracks().first;
-          _micTrack!.enabled = false;
+          _micTrack!.enabled = _talking;
         } catch (_) {
           _micTrack = null;
         }
@@ -1575,18 +2211,39 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
       pc.onTrack = (e) {
         if (e.streams.isNotEmpty && mounted) {
           setState(() => _remote.srcObject = e.streams.first);
+          if (_muted) {
+            for (final t in e.streams.first.getAudioTracks()) {
+              t.enabled = false;
+            }
+          }
         }
       };
       pc.onConnectionState = (s) {
-        if (!mounted) return;
+        if (!mounted || !identical(_pc, pc)) return;
+        final live = s == RTCPeerConnectionState.RTCPeerConnectionStateConnected;
         setState(() {
           _status = s.name.replaceAll('RTCPeerConnectionState', '');
-          _isConnected =
-              s == RTCPeerConnectionState.RTCPeerConnectionStateConnected;
+          _isConnected = live;
         });
-        if (_isConnected && _autoWide && !_autoWideDone) {
-          _autoWideDone = true;
-          _setWide(true); // go wide automatically once connected
+        if (live) {
+          _retryN = 0;
+          _wasLive = true;
+          _lostTimer?.cancel();
+          _prevLost = 0;
+          _prevRecv = 0;
+          if (_autoWide && !_autoWideDone) {
+            _autoWideDone = true;
+            _setWide(true); // go wide automatically once connected
+          }
+        } else if (s == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
+          _onLost();
+        } else if (s ==
+            RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+          // may recover by itself: give it a few seconds
+          _lostTimer?.cancel();
+          _lostTimer = Timer(const Duration(seconds: 4), () {
+            if (mounted && !_isConnected) _onLost();
+          });
         }
       };
       ws.listen((m) async {
@@ -1602,16 +2259,29 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
               _snack('التسجيل غير مدعوم على جهاز الكاميرا (Android فقط)');
             }
             break;
+          case 'health':
+            _onHealth(d as Map);
+            break;
           case 'denied':
             _denied = true;
+            _wantLive = false;
             if (mounted) setState(() => _status = 'PIN غير صحيح');
             _snack('PIN غير صحيح');
             await pc.close();
             _ws?.close();
             break;
+          case 'locked':
+            _denied = true;
+            _wantLive = false;
+            if (mounted) {
+              setState(() => _status = 'محاولات خاطئة كثيرة — انتظر 5 دقائق');
+            }
+            await pc.close();
+            _ws?.close();
+            break;
         }
       }, onDone: () {
-        if (mounted && !_denied) setState(() => _status = 'انقطع الاتصال');
+        if (identical(_ws, ws)) _onLost();
       });
 
       final offer = await pc.createOffer();
@@ -1620,12 +2290,240 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
       final l = await pc.getLocalDescription();
       ws.add(jsonEncode({'type': 'offer', 'sdp': l!.sdp, 'pin': _pinCtl.text}));
     } catch (e) {
-      if (mounted) setState(() => _status = _friendly(e));
+      if (e == 'wake-denied') _wantLive = false;
+      _scheduleRetry(_friendly(e));
+      if (!_wantLive && mounted) setState(() => _status = _friendly(e));
+    } finally {
+      _connecting = false;
     }
   }
 
+  void _alert(String m) {
+    HapticFeedback.heavyImpact();
+    SystemSound.play(SystemSoundType.alert);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(m),
+      backgroundColor: kRed,
+      duration: const Duration(seconds: 6),
+    ));
+  }
+
+  void _onHealth(Map d) {
+    final m = Map<String, dynamic>.from(d);
+    final ts = m['ts'];
+    if (ts is num) {
+      _camOffsetMs = ts.toInt() - DateTime.now().millisecondsSinceEpoch;
+    }
+    final bat = m['bat'];
+    final chg = m['chg'] == true;
+    if (bat is num) {
+      if (chg || bat > 25) {
+        _alertedBat20 = false;
+        _alertedBat10 = false;
+      } else if (bat <= 10 && !_alertedBat10) {
+        _alertedBat10 = true;
+        _alertedBat20 = true;
+        _alert('بطارية الكاميرا ${bat.toInt()}% — وصّلها بالشاحن');
+      } else if (bat <= 20 && !_alertedBat20) {
+        _alertedBat20 = true;
+        _alert('بطارية الكاميرا منخفضة ${bat.toInt()}%');
+      }
+    }
+    final t = m['temp'];
+    if (t is num) {
+      if (t >= 45 && !_alertedTemp) {
+        _alertedTemp = true;
+        _alert('حرارة جهاز الكاميرا مرتفعة ${t.toStringAsFixed(0)}°');
+      } else if (t < 41) {
+        _alertedTemp = false;
+      }
+    }
+    if (m['range'] is bool) _range = m['range'] as bool;
+    if (mounted) setState(() => _health = m);
+  }
+
+  /// Link quality as measured on this phone (RTT + packet loss).
+  Future<void> _pollStats() async {
+    final pc = _pc;
+    if (pc == null || !_isConnected || widget.screen) return;
+    var rtt = 0.0;
+    var lost = 0;
+    var recv = 0;
+    try {
+      for (final r in await pc.getStats()) {
+        final v = r.values;
+        if (r.type == 'inbound-rtp' &&
+            '${v['kind'] ?? v['mediaType']}' == 'video') {
+          lost = numOf(v['packetsLost']).toInt();
+          recv = numOf(v['packetsReceived']).toInt();
+        } else if (r.type == 'candidate-pair' && '${v['nominated']}' == 'true') {
+          rtt = max(rtt, numOf(v['currentRoundTripTime']));
+        }
+      }
+    } catch (_) {
+      return;
+    }
+    final dl = lost - _prevLost;
+    final dr = recv - _prevRecv;
+    _prevLost = lost;
+    _prevRecv = recv;
+    var loss = 0.0;
+    if (dl >= 0 && dr >= 0 && dl + dr > 20) loss = dl / (dl + dr);
+    final q = (loss > 0.08 || rtt > 0.5)
+        ? 'poor'
+        : ((loss > 0.025 || rtt > 0.25) ? 'fair' : 'good');
+    if (mounted && q != _link) setState(() => _link = q);
+  }
+
+  Future<void> _scanQr() async {
+    final v = await Navigator.push<String>(
+        context, MaterialPageRoute(builder: (_) => const QrScanPage()));
+    if (v == null || !mounted) return;
+    final p = v.split('|');
+    if (p.length < 4 || p[0] != 'LANCAM') {
+      _snack('رمز غير صالح');
+      return;
+    }
+    setState(() {
+      _ipCtl.text = p[1];
+      _pinCtl.text = p[3];
+    });
+    _connect();
+  }
+
+  Future<void> _shot() async {
+    final tracks = _remote.srcObject?.getVideoTracks();
+    if (tracks == null || tracks.isEmpty) {
+      _snack('لا يوجد بث');
+      return;
+    }
+    try {
+      final buf = await tracks.first.captureFrame();
+      final bytes = buf.asUint8List();
+      try {
+        if (!await Gal.hasAccess()) await Gal.requestAccess();
+        await Gal.putImageBytes(bytes);
+        _snack('تم حفظ اللقطة في الصور');
+      } catch (_) {
+        final dir = await getApplicationDocumentsDirectory();
+        final f = File('${dir.path}/shot_${fmtFile(DateTime.now())}.png');
+        await f.writeAsBytes(bytes);
+        _snack('تم حفظ اللقطة: ${f.path}');
+      }
+    } catch (_) {
+      _snack('تعذّر التقاط الصورة');
+    }
+  }
+
+  void _tools() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kSurface,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setM) => SafeArea(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('رؤية ليلية (تحسين العرض)',
+                      style: TextStyle(fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 8),
+                  Wrap(spacing: 8, children: [
+                    for (var i = 0; i < 3; i++)
+                      ChoiceChip(
+                        label: Text(const ['إيقاف', 'ليلي', 'ليلي قوي'][i]),
+                        selected: _night == i,
+                        onSelected: (_) {
+                          setState(() => _night = i);
+                          setM(() {});
+                          saveSettings({'night': i});
+                        },
+                      ),
+                  ]),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('ختم التاريخ والوقت'),
+                    value: _clockOn,
+                    onChanged: (v) {
+                      setState(() => _clockOn = v);
+                      setM(() {});
+                      saveSettings({'clock': v});
+                    },
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('وضع المدى البعيد'),
+                    subtitle: const Text(
+                        'يخفّض الجودة ليبقى الاتصال ثابتاً مع الإشارة الضعيفة',
+                        style: TextStyle(fontSize: 11, color: Colors.white54)),
+                    value: _range,
+                    onChanged: (v) {
+                      setState(() => _range = v);
+                      setM(() {});
+                      _send({'type': 'cmd', 'cmd': 'range', 'on': v});
+                    },
+                  ),
+                  TextButton.icon(
+                    icon: const Icon(Icons.zoom_out_map_rounded),
+                    label: const Text('إعادة ضبط الزوم'),
+                    onPressed: () {
+                      _tc.value = Matrix4.identity();
+                      Navigator.pop(ctx);
+                    },
+                  ),
+                ]),
+          ),
+        ),
+      ),
+    );
+  }
+
+  ColorFilter _nightFilter() {
+    final g = _night == 1 ? 1.7 : 2.6;
+    final o = _night == 1 ? 14.0 : 30.0;
+    return ColorFilter.matrix(<double>[
+      g, 0, 0, 0, o, //
+      0, g, 0, 0, o, //
+      0, 0, g, 0, o, //
+      0, 0, 0, 1, 0,
+    ]);
+  }
+
+  /// Live video: pinch to zoom (double-tap resets) + optional night view.
+  Widget _videoView() {
+    Widget v = RTCVideoView(_remote, objectFit: _fit);
+    if (_night > 0) v = ColorFiltered(colorFilter: _nightFilter(), child: v);
+    return GestureDetector(
+      onDoubleTap: () => _tc.value = Matrix4.identity(),
+      child: InteractiveViewer(
+        transformationController: _tc,
+        minScale: 1,
+        maxScale: 6,
+        child: v,
+      ),
+    );
+  }
+
+  Widget _hud() => IgnorePointer(
+        child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+          if (_clockOn && !widget.screen) ClockStamp(time: _now),
+          if (_clockOn && !widget.screen) const SizedBox(height: 5),
+          if (_isConnected && !widget.screen)
+            HealthBar(h: _health, link: _link),
+        ]),
+      );
+
   Future<void> _connectScreen(String ip) async {
-    _ws?.close();
+    final oldWs = _ws;
+    _ws = null; // so the old socket's onDone is ignored
+    oldWs?.close();
     _frame = null;
     final ws = _ws = await WebSocket.connect('ws://$ip:$kPort')
         .timeout(const Duration(seconds: 5));
@@ -1640,6 +2538,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
               _sh = (d['h'] as num).toInt();
               _ctl = d['control'] == true;
               _isConnected = true;
+              _retryN = 0;
               _status = _ctl
                   ? 'متصل — التحكم مفعّل'
                   : 'متصل — عرض فقط (فعّل التحكم على الجهاز الآخر)';
@@ -1654,8 +2553,15 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
             break;
           case 'denied':
             _denied = true;
+            _wantLive = false;
             setState(() => _status = 'PIN غير صحيح');
             _snack('PIN غير صحيح');
+            ws.close();
+            break;
+          case 'locked':
+            _denied = true;
+            _wantLive = false;
+            setState(() => _status = 'محاولات خاطئة كثيرة — انتظر 5 دقائق');
             ws.close();
             break;
         }
@@ -1663,11 +2569,11 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
         setState(() => _frame = m is Uint8List ? m : Uint8List.fromList(m));
       }
     }, onDone: () {
-      if (mounted && !_denied) {
-        setState(() {
-          _status = 'انقطع الاتصال';
-          _isConnected = false;
-        });
+      if (mounted && !_denied && identical(_ws, ws)) {
+        if (_isConnected) _alert('انقطع الاتصال بشاشة الهاتف — جاري إعادة الاتصال');
+        _isConnected = false;
+        _ws = null;
+        _scheduleRetry();
       }
     });
     ws.add(jsonEncode({'type': 'screen', 'pin': _pinCtl.text}));
@@ -1879,6 +2785,13 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _wantLive = false;
+    _retryTimer?.cancel();
+    _lostTimer?.cancel();
+    _statsTimer?.cancel();
+    _clockTimer?.cancel();
+    _now.dispose();
+    _tc.dispose();
     WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable();
     _pc?.close();
@@ -1892,8 +2805,10 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  Widget _controls({required bool dark}) => Row(
-        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+  Widget _controls({required bool dark}) => Wrap(
+        alignment: WrapAlignment.spaceEvenly,
+        spacing: 6,
+        runSpacing: 6,
         children: [
           CtlButton(
               icon: _talking ? Icons.mic : Icons.mic_off,
@@ -1914,6 +2829,11 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
               dark: dark,
               onTap: _toggleRec),
           CtlButton(
+              icon: Icons.photo_camera_rounded,
+              label: 'لقطة',
+              dark: dark,
+              onTap: _shot),
+          CtlButton(
               icon: Icons.cameraswitch,
               label: 'قلب',
               dark: dark,
@@ -1924,6 +2844,12 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
               active: _torch,
               dark: dark,
               onTap: _toggleTorch),
+          CtlButton(
+              icon: Icons.nightlight_round,
+              label: 'ليلي',
+              active: _night > 0,
+              dark: dark,
+              onTap: _tools),
           CtlButton(
               icon: _wide ? Icons.fullscreen_exit : Icons.fullscreen,
               label: _wide ? 'تصغير' : 'عريض',
@@ -1963,9 +2889,8 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
         backgroundColor: Colors.black,
         body: Stack(children: [
           Positioned.fill(
-              child: widget.screen
-                  ? _screenArea()
-                  : RTCVideoView(_remote, objectFit: _fit)),
+              child: widget.screen ? _screenArea() : _videoView()),
+          Positioned(top: 8, left: 12, child: SafeArea(child: _hud())),
           Positioned(
             top: 8,
             right: 12,
@@ -2057,11 +2982,24 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
                           height: 16,
                           child: CircularProgressIndicator(strokeWidth: 2))
                       : const Icon(Icons.search_rounded),
-                  label: const Text('بحث تلقائي'),
+                  label: const Text('بحث'),
                   onPressed: _scanning ? null : _scan,
                 ),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: const Size.fromHeight(46),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                  ),
+                  icon: const Icon(Icons.qr_code_scanner_rounded),
+                  label: const Text('QR'),
+                  onPressed: _scanQr,
+                ),
+              ),
+              const SizedBox(width: 8),
               Expanded(
                 child: FilledButton.icon(
                   style: FilledButton.styleFrom(
@@ -2115,6 +3053,11 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
                   textAlign: TextAlign.center,
                   style: const TextStyle(fontSize: 13, color: Colors.white70)),
             ),
+            if (_wantLive && !_isConnected)
+              TextButton(
+                onPressed: _stopRetry,
+                child: const Text('إيقاف'),
+              ),
           ]),
 
         // ── video ──
@@ -2129,9 +3072,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
             child: ClipRRect(
               borderRadius: BorderRadius.circular(18),
               child: Stack(fit: StackFit.expand, children: [
-                widget.screen
-                    ? _screenArea()
-                    : RTCVideoView(_remote, objectFit: _fit),
+                widget.screen ? _screenArea() : _videoView(),
                 if (!widget.screen && _remote.srcObject == null)
                   Container(
                     color: Colors.black,
@@ -2151,6 +3092,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
                 if (_remoteRec)
                   const Positioned(
                       top: 10, left: 10, child: Pill(color: kRed, text: 'REC')),
+                Positioned(bottom: 8, left: 8, right: 8, child: _hud()),
               ]),
             ),
           ),
@@ -2169,7 +3111,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
               ? _screenControls(dark: false)
               : _controls(dark: false),
         ),
-        if (!_isConnected)
+        if (!_isConnected && !_wantLive)
           SafeArea(
             top: false,
             child: Keypad(onKey: _key, onBack: _back),
@@ -2178,3 +3120,529 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
     );
   }
 }
+
+// ───────────────────────── Multi-camera grid (2×2) ─────────────────────────
+class MultiViewPage extends StatefulWidget {
+  const MultiViewPage({super.key});
+  @override
+  State<MultiViewPage> createState() => _MultiViewPageState();
+}
+
+class _MultiViewPageState extends State<MultiViewPage> {
+  List<Map<String, dynamic>> _cams = [];
+  bool _paused = false;
+  bool _wide = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WakelockPlus.enable();
+    loadSettings().then((s) {
+      final l = s['cams'];
+      if (l is List && mounted) {
+        setState(() => _cams = [
+              for (final c in l) Map<String, dynamic>.from(c as Map),
+            ]);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    WakelockPlus.disable();
+    _portrait();
+    super.dispose();
+  }
+
+  void _save() => saveSettings({'cams': _cams});
+
+  Future<void> _add() async {
+    final c = await showDialog<Map<String, dynamic>>(
+        context: context, builder: (_) => const _AddCamDialog());
+    if (c == null || !mounted) return;
+    setState(() => _cams.add(c));
+    _save();
+  }
+
+  void _remove(int i) {
+    setState(() => _cams.removeAt(i));
+    _save();
+  }
+
+  Future<void> _open(Map<String, dynamic> c) async {
+    // one viewer per camera: pause the tiles while the full viewer is open
+    setState(() => _paused = true);
+    await Navigator.push(
+        context,
+        MaterialPageRoute(
+            builder: (_) => ViewerPage(
+                  initialIp: '${c['ip']}',
+                  initialPin: '${c['pin']}',
+                  autoConnect: true,
+                )));
+    if (!mounted) return;
+    if (_wide) {
+      await _landscape();
+    } else {
+      await _portrait();
+    }
+    setState(() => _paused = false);
+  }
+
+  Future<void> _toggleWide() async {
+    if (_wide) {
+      await _portrait();
+    } else {
+      await _landscape();
+    }
+    if (mounted) setState(() => _wide = !_wide);
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(
+          title: const Text('عدة كاميرات'),
+          actions: [
+            IconButton(
+              icon: Icon(_wide
+                  ? Icons.stay_current_portrait_rounded
+                  : Icons.stay_current_landscape_rounded),
+              onPressed: _toggleWide,
+            ),
+            IconButton(
+              icon: const Icon(Icons.add_rounded),
+              onPressed: _cams.length >= 4 ? null : _add,
+            ),
+          ],
+        ),
+        body: _cams.isEmpty
+            ? Center(
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  const Icon(Icons.grid_view_rounded,
+                      size: 56, color: Colors.white24),
+                  const SizedBox(height: 12),
+                  const Text('أضف حتى 4 كاميرات وشاهدها معاً',
+                      style: TextStyle(color: Colors.white60)),
+                  const SizedBox(height: 16),
+                  FilledButton.icon(
+                    icon: const Icon(Icons.add_rounded),
+                    label: const Text('إضافة كاميرا'),
+                    onPressed: _add,
+                  ),
+                ]),
+              )
+            : Padding(
+                padding: const EdgeInsets.all(10),
+                child: GridView.count(
+                  crossAxisCount: 2,
+                  mainAxisSpacing: 10,
+                  crossAxisSpacing: 10,
+                  childAspectRatio: 16 / 9,
+                  children: [
+                    for (var i = 0; i < _cams.length; i++)
+                      _paused
+                          ? Container(
+                              decoration: BoxDecoration(
+                                color: Colors.black,
+                                borderRadius: BorderRadius.circular(14),
+                              ),
+                            )
+                          : _CamTile(
+                              key: ValueKey('${_cams[i]['ip']}|${_cams[i]['pin']}|$i'),
+                              cam: _cams[i],
+                              onOpen: () => _open(_cams[i]),
+                              onRemove: () => _remove(i),
+                            ),
+                  ],
+                ),
+              ),
+      );
+}
+
+class _AddCamDialog extends StatefulWidget {
+  const _AddCamDialog();
+  @override
+  State<_AddCamDialog> createState() => _AddCamDialogState();
+}
+
+class _AddCamDialogState extends State<_AddCamDialog> {
+  final _name = TextEditingController();
+  final _ip = TextEditingController();
+  final _pin = TextEditingController();
+  bool _scanning = false;
+  List<String> _found = [];
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _ip.dispose();
+    _pin.dispose();
+    super.dispose();
+  }
+
+  Future<void> _scan() async {
+    setState(() {
+      _scanning = true;
+      _found = [];
+    });
+    final r = await scanLan();
+    if (!mounted) return;
+    setState(() {
+      _scanning = false;
+      _found = r;
+    });
+  }
+
+  Future<void> _qr() async {
+    final v = await Navigator.push<String>(
+        context, MaterialPageRoute(builder: (_) => const QrScanPage()));
+    if (v == null || !mounted) return;
+    final p = v.split('|');
+    if (p.length < 4) return;
+    setState(() {
+      _ip.text = p[1];
+      _pin.text = p[3];
+    });
+  }
+
+  InputDecoration _dec(String label) => InputDecoration(
+        labelText: label,
+        filled: true,
+        fillColor: kBg,
+        border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+      );
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        backgroundColor: kSurface,
+        title: const Text('إضافة كاميرا'),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            TextField(controller: _name, decoration: _dec('الاسم (مثلاً: المدخل)')),
+            const SizedBox(height: 10),
+            TextField(
+              controller: _ip,
+              keyboardType: TextInputType.url,
+              textDirection: TextDirection.ltr,
+              decoration: _dec('IP الكاميرا'),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: _pin,
+              keyboardType: TextInputType.number,
+              textDirection: TextDirection.ltr,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+              decoration: _dec('PIN'),
+            ),
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  icon: _scanning
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.search_rounded, size: 18),
+                  label: const Text('بحث'),
+                  onPressed: _scanning ? null : _scan,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton.icon(
+                  icon: const Icon(Icons.qr_code_scanner_rounded, size: 18),
+                  label: const Text('QR'),
+                  onPressed: _qr,
+                ),
+              ),
+            ]),
+            if (_found.isNotEmpty)
+              Wrap(spacing: 6, children: [
+                for (final ip in _found)
+                  ActionChip(
+                    label: Text(ip),
+                    onPressed: () => setState(() => _ip.text = ip),
+                  ),
+              ]),
+          ]),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('إلغاء')),
+          FilledButton(
+            onPressed: () {
+              final ip = _ip.text.trim();
+              if (ip.isEmpty) return;
+              Navigator.pop(context, <String, dynamic>{
+                'name': _name.text.trim().isEmpty ? ip : _name.text.trim(),
+                'ip': ip,
+                'pin': _pin.text.trim(),
+              });
+            },
+            child: const Text('إضافة'),
+          ),
+        ],
+      );
+}
+
+/// One live camera inside the grid (view only, muted by default).
+class _CamTile extends StatefulWidget {
+  const _CamTile({
+    super.key,
+    required this.cam,
+    required this.onOpen,
+    required this.onRemove,
+  });
+  final Map<String, dynamic> cam;
+  final VoidCallback onOpen;
+  final VoidCallback onRemove;
+  @override
+  State<_CamTile> createState() => _CamTileState();
+}
+
+class _CamTileState extends State<_CamTile> {
+  final _r = RTCVideoRenderer();
+  RTCPeerConnection? _pc;
+  WebSocket? _ws;
+  Timer? _retry;
+  bool _alive = true;
+  bool _busy = false;
+  bool _fatal = false;
+  bool _live = false;
+  bool _muted = true;
+  int _n = 0;
+  String _msg = 'جاري الاتصال...';
+  Map _h = {};
+
+  String get _ip => '${widget.cam['ip']}';
+  String get _pin => '${widget.cam['pin']}';
+
+  @override
+  void initState() {
+    super.initState();
+    _r.initialize().then((_) => _connect());
+  }
+
+  String _why(Object e) {
+    if (e == 'denied') return 'الكاميرا رفضت (PIN أو الجاهزية الدائمة)';
+    if (e == 'unreachable') return 'الكاميرا غير متاحة';
+    if (e == 'timeout') return 'الكاميرا لا تستجيب';
+    if (e is SocketException) return 'تعذّر الاتصال';
+    if (e is TimeoutException) return 'انتهت المهلة';
+    return 'فشل الاتصال';
+  }
+
+  void _lost(String why) {
+    if (!_alive || _fatal) return;
+    if (_retry?.isActive == true) return;
+    _n++;
+    final secs = min(10, 1 + _n * 2);
+    if (mounted) {
+      setState(() {
+        _live = false;
+        _msg = '$why — إعادة بعد $secs ث';
+      });
+    }
+    _retry = Timer(Duration(seconds: secs), () {
+      final p = _pc;
+      final w = _ws;
+      _pc = null;
+      _ws = null;
+      p?.close();
+      w?.close();
+      _connect();
+    });
+  }
+
+  Future<void> _connect() async {
+    if (!_alive || _busy) return;
+    _busy = true;
+    try {
+      await applyNetConfig();
+      if (mounted) setState(() => _msg = 'جاري الاتصال...');
+      if (!await portOpen(_ip, kPort)) {
+        if (mounted) setState(() => _msg = 'إيقاظ الكاميرا...');
+        final w = await wakeCamera(_ip, _pin);
+        if (w != 'ok') throw w == 'denied' ? 'denied' : 'unreachable';
+        var up = false;
+        for (var i = 0; i < 25 && !up && _alive; i++) {
+          await Future.delayed(const Duration(seconds: 1));
+          up = await portOpen(_ip, kPort);
+        }
+        if (!up) throw 'timeout';
+      }
+      if (!_alive) return;
+      final op = _pc;
+      final ow = _ws;
+      _pc = null;
+      _ws = null;
+      await op?.close();
+      ow?.close();
+      final ws = _ws = await WebSocket.connect('ws://$_ip:$kPort')
+          .timeout(const Duration(seconds: 5));
+      final pc = _pc = await createPeerConnection(kPcConfig);
+      await pc.addTransceiver(
+        kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
+        init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
+      );
+      await pc.addTransceiver(
+        kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
+        init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
+      );
+      pc.onTrack = (e) {
+        if (e.track.kind == 'audio') e.track.enabled = !_muted;
+        if (e.track.kind == 'video' && e.streams.isNotEmpty && mounted) {
+          setState(() => _r.srcObject = e.streams.first);
+        }
+      };
+      pc.onConnectionState = (s) {
+        if (!_alive || !identical(_pc, pc)) return;
+        final live = s == RTCPeerConnectionState.RTCPeerConnectionStateConnected;
+        if (live) _n = 0;
+        if (mounted) setState(() => _live = live);
+        if (s == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
+            s == RTCPeerConnectionState.RTCPeerConnectionStateClosed) {
+          _lost('انقطع');
+        }
+      };
+      ws.listen((m) async {
+        if (m is! String) return;
+        final d = jsonDecode(m);
+        switch (d['type']) {
+          case 'answer':
+            await pc.setRemoteDescription(
+                RTCSessionDescription(d['sdp'] as String, 'answer'));
+            break;
+          case 'health':
+            if (mounted) setState(() => _h = Map<String, dynamic>.from(d));
+            break;
+          case 'denied':
+            _fatal = true;
+            if (mounted) setState(() => _msg = 'PIN غير صحيح');
+            break;
+          case 'locked':
+            _fatal = true;
+            if (mounted) setState(() => _msg = 'محاولات كثيرة — انتظر 5 دقائق');
+            break;
+        }
+      }, onDone: () {
+        if (identical(_ws, ws)) _lost('انقطع');
+      });
+      final offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitIceGathered(pc);
+      final l = await pc.getLocalDescription();
+      ws.add(jsonEncode({'type': 'offer', 'sdp': l!.sdp, 'pin': _pin}));
+    } catch (e) {
+      _lost(_why(e));
+    } finally {
+      _busy = false;
+    }
+  }
+
+  void _toggleMute() {
+    setState(() => _muted = !_muted);
+    for (final t in _r.srcObject?.getAudioTracks() ?? <MediaStreamTrack>[]) {
+      t.enabled = !_muted;
+    }
+    if (!_muted) {
+      Helper.setSpeakerphoneOn(true).catchError((_) {});
+    }
+  }
+
+  @override
+  void dispose() {
+    _alive = false;
+    _retry?.cancel();
+    _pc?.close();
+    _ws?.close();
+    _r.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bat = _h['bat'];
+    return GestureDetector(
+      onTap: widget.onOpen,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(14),
+        child: Stack(fit: StackFit.expand, children: [
+          Container(color: Colors.black),
+          if (_r.srcObject != null)
+            RTCVideoView(_r,
+                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover),
+          if (!_live)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.all(8),
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  const Icon(Icons.videocam_off_outlined,
+                      size: 26, color: Colors.white24),
+                  const SizedBox(height: 4),
+                  Text(_msg,
+                      textAlign: TextAlign.center,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 10, color: Colors.white54)),
+                ]),
+              ),
+            ),
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: Container(
+              color: const Color(0x99000000),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              child: Row(children: [
+                Container(
+                  width: 7,
+                  height: 7,
+                  decoration: BoxDecoration(
+                    color: _live ? kGreen : Colors.amber,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text('${widget.cam['name']}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 11, color: Colors.white)),
+                ),
+                if (bat is num)
+                  Text('${bat.toInt()}%',
+                      style: TextStyle(
+                          fontSize: 10,
+                          color: bat <= 20 ? kRed : Colors.white70)),
+                const SizedBox(width: 8),
+                GestureDetector(
+                  onTap: _toggleMute,
+                  child: Icon(_muted ? Icons.volume_off : Icons.volume_up,
+                      size: 16, color: Colors.white70),
+                ),
+              ]),
+            ),
+          ),
+          Positioned(
+            top: 2,
+            left: 2,
+            child: GestureDetector(
+              onTap: widget.onRemove,
+              child: const Padding(
+                padding: EdgeInsets.all(4),
+                child: Icon(Icons.close_rounded, size: 16, color: Colors.white54),
+              ),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+```

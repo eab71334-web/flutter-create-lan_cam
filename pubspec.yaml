@@ -17,6 +17,10 @@ dependencies:
   mobile_scanner: ^6.0.2
   battery_plus: ^6.2.0
   gal: ^2.3.0
+  quick_actions: ^1.0.7
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/tls/cert.pem
+    - assets/tls/key.pem

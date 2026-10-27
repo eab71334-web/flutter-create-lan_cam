@@ -1,9 +1,9 @@
-```dart
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -15,6 +15,9 @@ import 'package:mobile_scanner/mobile_scanner.dart'
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:qr_flutter/qr_flutter.dart' show QrImageView, QrVersions;
+import 'package:quick_actions/quick_actions.dart';
+
+import 'person.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 const int kPort = 8080;
@@ -36,7 +39,14 @@ const Color kAccent = Color(0xFF22D3EE);
 const Color kRed = Color(0xFFEF4444);
 const Color kGreen = Color(0xFF22C55E);
 
-void main() => runApp(MaterialApp(
+final GlobalKey<NavigatorState> kNav = GlobalKey<NavigatorState>();
+final ValueNotifier<int> kThumbRev = ValueNotifier<int>(0);
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await loadTls();
+  runApp(MaterialApp(
+      navigatorKey: kNav,
       debugShowCheckedModeBanner: false,
       title: 'LAN Cam',
       theme: ThemeData(
@@ -56,6 +66,7 @@ void main() => runApp(MaterialApp(
           Directionality(textDirection: TextDirection.rtl, child: child!),
       home: const Home(),
     ));
+}
 
 // ───────────────────────────── Helpers ─────────────────────────────
 Future<void> _portrait() async {
@@ -252,6 +263,213 @@ Future<String> wakeCamera(String ip, String pin) async {
   } catch (_) {
     return 'noreply';
   }
+}
+
+// ───────────────── TLS (signalling, library, PIN) ─────────────────
+// The build embeds one certificate + key (assets/tls). Both phones carry the
+// same identity, so a client accepts only a server presenting that exact cert.
+String? _tlsCert;
+String? _tlsKey;
+List<int>? _tlsDer;
+bool get kTls => _tlsDer != null && _tlsKey != null;
+
+Future<void> loadTls() async {
+  try {
+    final c = (await rootBundle.loadString('assets/tls/cert.pem')).trim();
+    final k = (await rootBundle.loadString('assets/tls/key.pem')).trim();
+    if (!c.contains('BEGIN CERTIFICATE') || !k.contains('PRIVATE KEY')) return;
+    final b64 = c
+        .split('\n')
+        .where((l) => !l.startsWith('-----'))
+        .join()
+        .replaceAll('\r', '')
+        .trim();
+    _tlsDer = base64Decode(b64);
+    _tlsCert = c;
+    _tlsKey = k;
+  } catch (_) {
+    _tlsDer = null;
+  }
+}
+
+SecurityContext? tlsServerContext() {
+  if (!kTls) return null;
+  return SecurityContext()
+    ..useCertificateChainBytes(utf8.encode(_tlsCert!))
+    ..usePrivateKeyBytes(utf8.encode(_tlsKey!));
+}
+
+bool _sameCert(List<int> der) {
+  final a = _tlsDer;
+  if (a == null || a.length != der.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != der[i]) return false;
+  }
+  return true;
+}
+
+HttpClient tlsClient() => HttpClient()
+  ..badCertificateCallback =
+      (X509Certificate cert, String host, int port) => _sameCert(cert.der);
+
+Future<WebSocket> openWs(String ip) => kTls
+    ? WebSocket.connect('wss://$ip:$kPort', customClient: tlsClient())
+    : WebSocket.connect('ws://$ip:$kPort');
+
+/// Long-press shortcuts on the app icon: one per saved camera (max 4).
+Future<void> refreshShortcuts() async {
+  try {
+    final q = QuickActions();
+    final s = await loadSettings();
+    final l = s['cams'];
+    final items = <ShortcutItem>[];
+    if (l is List) {
+      for (var i = 0; i < l.length && i < 4; i++) {
+        items.add(ShortcutItem(
+            type: 'cam$i', localizedTitle: '${(l[i] as Map)['name']}'));
+      }
+    }
+    await q.setShortcutItems(items);
+  } catch (_) {}
+}
+
+void initShortcuts() {
+  try {
+    final q = QuickActions();
+    q.initialize((type) async {
+      final s = await loadSettings();
+      final l = s['cams'];
+      final i = int.tryParse(type.replaceFirst('cam', ''));
+      if (l is! List || i == null || i < 0 || i >= l.length) return;
+      final c = Map<String, dynamic>.from(l[i] as Map);
+      kNav.currentState?.push(MaterialPageRoute(
+          builder: (_) => ViewerPage(
+                initialIp: '${c['ip']}',
+                initialPin: '${c['pin']}',
+                autoConnect: true,
+              )));
+    });
+  } catch (_) {}
+  refreshShortcuts();
+}
+
+/// Last picture seen from the camera(s), shown on the home cards.
+class ThumbPreview extends StatefulWidget {
+  const ThumbPreview({
+    super.key,
+    required this.multi,
+    required this.icon,
+    required this.color,
+    required this.tint,
+  });
+  final bool multi;
+  final IconData icon;
+  final Color color;
+  final Color tint;
+  @override
+  State<ThumbPreview> createState() => _ThumbPreviewState();
+}
+
+class _ThumbPreviewState extends State<ThumbPreview> {
+  List<Uint8List> _imgs = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+    kThumbRev.addListener(_load);
+  }
+
+  @override
+  void dispose() {
+    kThumbRev.removeListener(_load);
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final s = await loadSettings();
+    final ips = <String>[];
+    if (widget.multi) {
+      final l = s['cams'];
+      if (l is List) {
+        for (final c in l.take(4)) {
+          ips.add('${(c as Map)['ip']}');
+        }
+      }
+    } else {
+      final ip = s['ip'];
+      if (ip is String && ip.isNotEmpty) ips.add(ip);
+    }
+    final out = <Uint8List>[];
+    for (final ip in ips) {
+      final f = await thumbFile(ip);
+      if (await f.exists()) out.add(await f.readAsBytes());
+    }
+    if (mounted) setState(() => _imgs = out);
+  }
+
+  Widget _img(Uint8List b) => Image.memory(b,
+      fit: BoxFit.cover,
+      gaplessPlayback: true,
+      errorBuilder: (_, __, ___) => const SizedBox());
+
+  @override
+  Widget build(BuildContext context) => Container(
+        width: 56,
+        height: 56,
+        clipBehavior: Clip.antiAlias,
+        decoration: BoxDecoration(
+          color: widget.tint,
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: _imgs.isEmpty
+            ? Icon(widget.icon, color: widget.color, size: 30)
+            : _imgs.length == 1
+                ? _img(_imgs[0])
+                : GridView.count(
+                    crossAxisCount: 2,
+                    padding: EdgeInsets.zero,
+                    mainAxisSpacing: 1,
+                    crossAxisSpacing: 1,
+                    physics: const NeverScrollableScrollPhysics(),
+                    children: [for (final b in _imgs) _img(b)],
+                  ),
+      );
+}
+
+class _DotPainter extends CustomPainter {
+  _DotPainter(this.p);
+  final Offset p;
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawCircle(p, 22, Paint()..color = const Color(0x33FFFFFF));
+    canvas.drawCircle(
+        p,
+        22,
+        Paint()
+          ..color = const Color(0x88FFFFFF)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2);
+  }
+
+  @override
+  bool shouldRepaint(_DotPainter old) => old.p != p;
+}
+
+class _Gray {
+  _Gray(this.g, this.w, this.h);
+  final Uint8List g;
+  final int w;
+  final int h;
+}
+
+/// A motion snapshot received by the viewer.
+class _Evt {
+  _Evt(this.t, this.img, [this.kind = 'motion']);
+  final DateTime t;
+  final Uint8List img;
+  final String kind; // motion | sound
+  Uint8List? img2; // snapshot 3 s later (before / after comparison)
 }
 
 const List<String> kQualityNames = [
@@ -675,7 +893,9 @@ class ModeCard extends StatelessWidget {
     required this.color,
     required this.tint,
     required this.onTap,
+    this.leading,
   });
+  final Widget? leading;
   final IconData icon;
   final String title;
   final String subtitle;
@@ -697,15 +917,16 @@ class ModeCard extends StatelessWidget {
               border: Border.all(color: Colors.white10),
             ),
             child: Row(children: [
-              Container(
-                width: 56,
-                height: 56,
-                decoration: BoxDecoration(
-                  color: tint,
-                  borderRadius: BorderRadius.circular(16),
-                ),
-                child: Icon(icon, color: color, size: 30),
-              ),
+              leading ??
+                  Container(
+                    width: 56,
+                    height: 56,
+                    decoration: BoxDecoration(
+                      color: tint,
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Icon(icon, color: color, size: 30),
+                  ),
               const SizedBox(width: 14),
               Expanded(
                 child: Column(
@@ -740,6 +961,7 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _checkAutostart();
+    initShortcuts();
   }
 
   @override
@@ -807,6 +1029,11 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
                     ),
                     const SizedBox(height: 14),
                     ModeCard(
+                      leading: const ThumbPreview(
+                          multi: false,
+                          icon: Icons.visibility_rounded,
+                          color: Color(0xFFA78BFA),
+                          tint: Color(0x26A78BFA)),
                       icon: Icons.visibility_rounded,
                       title: 'وضع المشاهدة',
                       subtitle: 'شاهد البث واتحكم بالكاميرا عن بعد',
@@ -817,6 +1044,11 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
                     ),
                     const SizedBox(height: 14),
                     ModeCard(
+                      leading: const ThumbPreview(
+                          multi: true,
+                          icon: Icons.grid_view_rounded,
+                          color: Color(0xFFF472B6),
+                          tint: Color(0x26F472B6)),
                       icon: Icons.grid_view_rounded,
                       title: 'عدة كاميرات',
                       subtitle: 'شاهد حتى 4 كاميرات معاً في شبكة 2×2',
@@ -997,12 +1229,114 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
             ),
           ]),
+          _group('التنبيهات (جهاز المشاهدة)', Icons.notifications_active_rounded, [
+            _chips<int>('تنبيه بطارية الكاميرا عند', 'alertBat', 20,
+                [15, 20, 30], ['15%', '20%', '30%']),
+            _chips<int>('تنبيه حرارة الكاميرا عند', 'alertTemp', 45,
+                [42, 45, 48], ['42°', '45°', '48°']),
+            _chips<bool>('صوت التنبيه', 'alertSound', true, [true, false],
+                ['تشغيل', 'إيقاف']),
+            _chips<bool>('اهتزاز التنبيه', 'alertHaptic', true, [true, false],
+                ['تشغيل', 'إيقاف']),
+            _chips<int>('أقل فاصل بين تنبيهات الحركة والصوت', 'alertGap', 20,
+                [10, 20, 60], ['10 ث', '20 ث', 'دقيقة']),
+          ]),
+          _group('المشاهدة', Icons.visibility_rounded, [
+            _chips<bool>('إعادة الاتصال التلقائية', 'autoRetry', true,
+                [true, false], ['مفعّلة', 'معطّلة']),
+            _chips<bool>('كتم الصوت عند الاتصال', 'muteStart', false,
+                [false, true], ['لا', 'نعم']),
+            _chips<bool>('إبقاء الشاشة مضاءة', 'keepOn', true, [true, false],
+                ['نعم', 'لا']),
+          ]),
+          _group('الأمان', Icons.lock_rounded, [
+            _chips<int>('محاولات PIN الخاطئة قبل القفل', 'lockTries', 5,
+                [3, 5, 10], ['3', '5', '10']),
+            _chips<int>('مدة القفل', 'lockMin', 5, [1, 5, 15],
+                ['دقيقة', '5 دقائق', '15 دقيقة']),
+            _chips<bool>('PIN جديد عند كل تشغيل للكاميرا', 'pinRotate', false,
+                [false, true], ['لا', 'نعم']),
+            Container(
+              margin: const EdgeInsets.only(bottom: 14),
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: kBg,
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Text(
+                  kTls
+                      ? 'تشفير TLS: مفعّل في هذا الإصدار (يشمل البث والـ PIN والمكتبة). إيقاظ الكاميرا (المنفذ 8081) ما زال غير مشفّر.'
+                      : 'تشفير TLS: غير مضمّن في هذا الإصدار.',
+                  style: TextStyle(
+                      fontSize: 12, color: kTls ? kGreen : Colors.amber)),
+            ),
+          ]),
+          _group('متقدم', Icons.build_rounded, [
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.copy_rounded),
+              title: const Text('نسخ معلومات التشخيص'),
+              subtitle: const Text('تُنسخ بدون الـ PIN، للصقها عند طلب المساعدة',
+                  style: TextStyle(fontSize: 11, color: Colors.white54)),
+              onTap: () async {
+                final c = Map<String, dynamic>.from(_s)
+                  ..remove('pin')
+                  ..remove('campin')
+                  ..remove('cams');
+                final txt = 'LAN Cam | ${Platform.operatingSystem} '
+                    '${Platform.operatingSystemVersion}\n'
+                    'TLS: $kTls | Person: $kPersonSupported\n'
+                    '${jsonEncode(c)}';
+                await Clipboard.setData(ClipboardData(text: txt));
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('تم النسخ')));
+                }
+              },
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.restart_alt_rounded),
+              title: const Text('إعادة ضبط كل الإعدادات'),
+              subtitle: const Text('تُحذف الإعدادات والكاميرات المحفوظة',
+                  style: TextStyle(fontSize: 11, color: Colors.white54)),
+              onTap: () async {
+                final ok = await showDialog<bool>(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    backgroundColor: kSurface,
+                    title: const Text('إعادة ضبط كل شيء؟'),
+                    actions: [
+                      TextButton(
+                          onPressed: () => Navigator.pop(ctx, false),
+                          child: const Text('إلغاء')),
+                      FilledButton(
+                          onPressed: () => Navigator.pop(ctx, true),
+                          child: const Text('إعادة ضبط')),
+                    ],
+                  ),
+                );
+                if (ok != true) return;
+                try {
+                  await (await _settingsFile()).writeAsString('{}');
+                } catch (_) {}
+                if (mounted) setState(() => _s = {});
+              },
+            ),
+          ]),
           _group('مشاركة الشاشة والتحكم', Icons.phone_android_rounded, [
-            _chips<int>('الإطارات', 'sfps', 10, [5, 10, 15], ['5', '10', '15']),
-            _chips<int>('جودة الصورة', 'squality', 60, [40, 60, 80],
-                ['منخفضة', 'متوسطة', 'عالية']),
-            _chips<int>('الدقة', 'sside', 1280, [960, 1280, 1920],
-                ['منخفضة', 'متوسطة', 'عالية']),
+            _chips<int>('الإطارات في الثانية (الحد الأعلى)', 'sfps', 60,
+                [30, 60, 90, 120], ['30', '60', '90', '120']),
+            _chips<int>('جودة الصورة', 'squality', 50, [30, 50, 70, 85],
+                ['سريعة جداً', 'سريعة', 'متوازنة', 'عالية']),
+            _chips<int>('الدقة', 'sside', 960, [720, 960, 1280, 1920],
+                ['720', '960', '1280', '1920']),
+            const Padding(
+              padding: EdgeInsets.only(bottom: 14),
+              child: Text(
+                  'الإطارات الفعلية تعتمد على سرعة هاتف Android في ضغط الصور وعلى الواي فاي. للحصول على أعلى معدل اختر دقة وجودة أقل.',
+                  style: TextStyle(fontSize: 11, color: Colors.white54)),
+            ),
           ]),
           const Padding(
             padding: EdgeInsets.symmetric(horizontal: 22),
@@ -1068,6 +1402,54 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   Timer? _srtTimer;
   int _srtN = 0;
   DateTime? _recStart;
+  // motion detection / zones / loop recording
+  Timer? _motionTimer;
+  Timer? _loopTimer;
+  bool _mOn = false;
+  bool _mRec = false;
+  int _mSens = 1;
+  bool _mFilter = true;
+  String _mZMode = 'ignore';
+  String _mZMask = '0' * 48;
+  int _mLoop = 0; // MB, 0 = off
+  Uint8List? _prevG;
+  int _gw = 0;
+  int _gh = 0;
+  int _streak = 0;
+  bool _motionBusy = false;
+  bool _motionNow = false;
+  bool _autoRec = false;
+  String? _recPath;
+  DateTime _lastMotion = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastAlert = DateTime.fromMillisecondsSinceEpoch(0);
+  // sound detection / schedule / power saving / siren
+  bool _sOn = false;
+  bool _sched = false;
+  int _sSh = 22;
+  int _sEh = 6;
+  bool _idleDim = false;
+  bool _dim = false;
+  DateTime? _idleSince;
+  RTCPeerConnection? _probeA;
+  RTCPeerConnection? _probeB;
+  Timer? _soundTimer;
+  Timer? _sirenTimer;
+  double _ambient = 0.02;
+  int _loudStreak = 0;
+  int _noLevel = 0;
+  bool? _soundOk;
+  DateTime _lastSound = DateTime.fromMillisecondsSinceEpoch(0);
+  // pre-motion recording / person check / security limits
+  bool _pre = false;
+  bool _rolling = false;
+  bool _preBusy = false;
+  DateTime _rollStart = DateTime.now();
+  Timer? _preTimer;
+  bool _mPerson = false;
+  int _lockTries = 5;
+  int _lockMin = 5;
+  int _alertGap = 20;
+  bool get _recShown => _recording && !_rolling;
 
   @override
   void initState() {
@@ -1080,12 +1462,32 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
 
   Future<void> _start() async {
     final s = await loadSettings();
-    _pin = (s['campin'] as String?) ?? _newPin();
+    _pin = (s['pinRotate'] == true)
+        ? _newPin()
+        : ((s['campin'] as String?) ?? _newPin());
     await saveSettings({'campin': _pin});
     _always = (s['always'] as bool?) ?? false;
     _range = (s['range'] as bool?) ?? false;
     _clockOn = (s['clock'] as bool?) ?? true;
     _level = _range ? 3 : 0;
+    _mOn = (s['m_on'] as bool?) ?? false;
+    _mRec = (s['m_rec'] as bool?) ?? false;
+    _mSens = ((s['m_sens'] as int?) ?? 1).clamp(0, 2).toInt();
+    _mFilter = (s['m_filter'] as bool?) ?? true;
+    _mZMode = (s['m_zmode'] as String?) ?? 'ignore';
+    final zm = (s['m_zmask'] as String?) ?? '';
+    if (zm.length == 48) _mZMask = zm;
+    _mLoop = (s['m_loop'] as int?) ?? 0;
+    _sOn = (s['m_son'] as bool?) ?? false;
+    _sched = (s['m_sched'] as bool?) ?? false;
+    _sSh = (s['m_sh'] as int?) ?? 22;
+    _sEh = (s['m_eh'] as int?) ?? 6;
+    _idleDim = (s['idle_dim'] as bool?) ?? false;
+    _pre = (s['m_pre'] as bool?) ?? false;
+    _mPerson = (s['m_person'] as bool?) ?? false;
+    _lockTries = (s['lockTries'] as int?) ?? 5;
+    _lockMin = (s['lockMin'] as int?) ?? 5;
+    _alertGap = (s['alertGap'] as int?) ?? 20;
     await applyNetConfig();
     if (Platform.isAndroid) {
       try {
@@ -1147,12 +1549,13 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       } catch (_) {}
     }
 
-    _server = await HttpServer.bind(InternetAddress.anyIPv4, kPort);
+    final tctx = tlsServerContext();
+    _server = tctx != null
+        ? await HttpServer.bindSecure(InternetAddress.anyIPv4, kPort, tctx)
+        : await HttpServer.bind(InternetAddress.anyIPv4, kPort);
     _server!.listen((req) async {
       if (!WebSocketTransformer.isUpgradeRequest(req)) {
-        req.response
-          ..write('LAN Cam')
-          ..close();
+        await _http(req);
         return;
       }
       final remote = req.connectionInfo?.remoteAddress.address ?? '?';
@@ -1179,6 +1582,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
             _ws = ws;
             await _answer(ws, d['sdp'] as String);
             _sendRec();
+            _sendCfg();
             break;
           case 'record':
             if (authed) await _setRec(d['on'] == true);
@@ -1205,6 +1609,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
           case 'tap':
           case 'swipe':
           case 'nav':
+          case 'touch':
             if (authed) await _remoteInput(d);
             break;
         }
@@ -1217,8 +1622,18 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     _healthTimer =
         Timer.periodic(const Duration(seconds: 4), (_) => _sendHealth());
     _adaptTimer = Timer.periodic(const Duration(seconds: 3), (_) => _adapt());
-    _clockTimer = Timer.periodic(
-        const Duration(seconds: 1), (_) => _now.value = DateTime.now());
+    _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _now.value = DateTime.now();
+      _idleTick();
+    });
+    _soundTimer =
+        Timer.periodic(const Duration(milliseconds: 500), (_) => _soundTick());
+    _preTimer = Timer.periodic(const Duration(seconds: 1), (_) => _preTick());
+    _motionTimer =
+        Timer.periodic(const Duration(seconds: 1), (_) => _motionTick());
+    _loopTimer =
+        Timer.periodic(const Duration(seconds: 60), (_) => _enforceLoop());
+    _enforceLoop();
     _sendHealth();
 
     // Woken remotely while the app was closed: hide again once we are live.
@@ -1289,8 +1704,8 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     final l = _fails[ip];
     if (l == null) return false;
     l.removeWhere(
-        (t) => DateTime.now().difference(t) > const Duration(minutes: 5));
-    return l.length >= 5;
+        (t) => DateTime.now().difference(t) > Duration(minutes: _lockMin));
+    return l.length >= _lockTries;
   }
 
   /// Weak link -> lower quality automatically; good link -> step back up.
@@ -1359,6 +1774,670 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     try {
       _ws?.add(jsonEncode({'type': 'health', ...m}));
     } catch (_) {}
+  }
+
+  // ───────────── motion detection ─────────────
+  void _sendCfg() {
+    try {
+      _ws?.add(jsonEncode({
+        'type': 'cfg',
+        'on': _mOn,
+        'rec': _mRec,
+        'sens': _mSens,
+        'filter': _mFilter,
+        'zmode': _mZMode,
+        'zmask': _mZMask,
+        'loop': _mLoop,
+        'android': Platform.isAndroid,
+        'son': _sOn,
+        'sound': _soundOk,
+        'sched': _sched,
+        'sh': _sSh,
+        'eh': _sEh,
+        'pre': _pre,
+        'person': _mPerson,
+        'personAvail': kPersonSupported,
+      }));
+    } catch (_) {}
+  }
+
+  void _applyCfg(Map d) {
+    if (d['on'] is bool) _mOn = d['on'] as bool;
+    if (d['rec'] is bool) _mRec = d['rec'] as bool;
+    if (d['sens'] is num) {
+      _mSens = (d['sens'] as num).toInt().clamp(0, 2).toInt();
+    }
+    if (d['filter'] is bool) _mFilter = d['filter'] as bool;
+    if (d['zmode'] == 'ignore' || d['zmode'] == 'only') {
+      _mZMode = d['zmode'] as String;
+    }
+    if (d['zmask'] is String && (d['zmask'] as String).length == 48) {
+      _mZMask = d['zmask'] as String;
+    }
+    if (d['loop'] is num) {
+      _mLoop = (d['loop'] as num).toInt().clamp(0, 102400).toInt();
+    }
+    if (d['son'] is bool) {
+      _sOn = d['son'] as bool;
+      if (!_sOn) _closeProbe();
+    }
+    if (d['sched'] is bool) _sched = d['sched'] as bool;
+    if (d['pre'] is bool) _pre = d['pre'] as bool;
+    if (d['person'] is bool) _mPerson = d['person'] as bool;
+    if (d['sh'] is num) _sSh = (d['sh'] as num).toInt().clamp(0, 23).toInt();
+    if (d['eh'] is num) _sEh = (d['eh'] as num).toInt().clamp(0, 23).toInt();
+    if (d['idle'] is bool) {
+      _idleDim = d['idle'] as bool;
+      saveSettings({'idle_dim': _idleDim});
+    }
+    _prevG = null;
+    _streak = 0;
+    saveSettings({
+      'm_pre': _pre,
+      'm_person': _mPerson,
+      'm_son': _sOn,
+      'm_sched': _sched,
+      'm_sh': _sSh,
+      'm_eh': _sEh,
+      'm_on': _mOn,
+      'm_rec': _mRec,
+      'm_sens': _mSens,
+      'm_filter': _mFilter,
+      'm_zmode': _mZMode,
+      'm_zmask': _mZMask,
+      'm_loop': _mLoop,
+    });
+    _sendCfg();
+    _enforceLoop();
+    if (mounted) setState(() {});
+  }
+
+  Future<_Gray?> _gray(Uint8List png, int tw) async {
+    ui.Codec? codec;
+    ui.Image? img;
+    try {
+      codec = await ui.instantiateImageCodec(png, targetWidth: tw);
+      img = (await codec.getNextFrame()).image;
+      final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+      if (bd == null) return null;
+      final w = img.width;
+      final h = img.height;
+      final px = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
+      final g = Uint8List(w * h);
+      for (var i = 0, j = 0; i < w * h; i++, j += 4) {
+        g[i] = (px[j] * 30 + px[j + 1] * 59 + px[j + 2] * 11) ~/ 100;
+      }
+      return _Gray(g, w, h);
+    } catch (_) {
+      return null;
+    } finally {
+      img?.dispose();
+      codec?.dispose();
+    }
+  }
+
+  Future<Uint8List?> _thumb(Uint8List png) async {
+    ui.Codec? codec;
+    ui.Image? img;
+    try {
+      codec = await ui.instantiateImageCodec(png, targetWidth: 480);
+      img = (await codec.getNextFrame()).image;
+      final bd = await img.toByteData(format: ui.ImageByteFormat.png);
+      if (bd == null) return null;
+      return bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
+    } catch (_) {
+      return null;
+    } finally {
+      img?.dispose();
+      codec?.dispose();
+    }
+  }
+
+  /// [changed fraction, largest blob (cells)] between two gray frames,
+  /// after removing global brightness change and applying the zones.
+  List<double> _analyze(Uint8List a, Uint8List b, int w, int h) {
+    var sa = 0;
+    var sb = 0;
+    for (var i = 0; i < a.length; i++) {
+      sa += a[i];
+      sb += b[i];
+    }
+    final off = (sb - sa) ~/ a.length;
+    final thr = const [30, 20, 12][_mSens];
+    final ch = Uint8List(w * h);
+    var counted = 0;
+    var changed = 0;
+    final hasMask = _mZMask.length == 48;
+    for (var y = 0; y < h; y++) {
+      final cy = y * 6 ~/ h;
+      for (var x = 0; x < w; x++) {
+        final cx = x * 8 ~/ w;
+        final inZ = hasMask && _mZMask[cy * 8 + cx] == '1';
+        if (_mZMode == 'ignore' ? inZ : !inZ) continue;
+        counted++;
+        final i = y * w + x;
+        if (((b[i] - a[i]) - off).abs() > thr) {
+          ch[i] = 1;
+          changed++;
+        }
+      }
+    }
+    if (counted == 0) return [0, 0];
+    var best = 0;
+    if (changed > 0) {
+      final seen = Uint8List(w * h);
+      final st = <int>[];
+      for (var s0 = 0; s0 < ch.length; s0++) {
+        if (ch[s0] == 0 || seen[s0] == 1) continue;
+        var size = 0;
+        st.add(s0);
+        seen[s0] = 1;
+        while (st.isNotEmpty) {
+          final p = st.removeLast();
+          size++;
+          final x = p % w;
+          final y = p ~/ w;
+          if (x > 0 && ch[p - 1] == 1 && seen[p - 1] == 0) {
+            seen[p - 1] = 1;
+            st.add(p - 1);
+          }
+          if (x < w - 1 && ch[p + 1] == 1 && seen[p + 1] == 0) {
+            seen[p + 1] = 1;
+            st.add(p + 1);
+          }
+          if (y > 0 && ch[p - w] == 1 && seen[p - w] == 0) {
+            seen[p - w] = 1;
+            st.add(p - w);
+          }
+          if (y < h - 1 && ch[p + w] == 1 && seen[p + w] == 0) {
+            seen[p + w] = 1;
+            st.add(p + w);
+          }
+        }
+        if (size > best) best = size;
+      }
+    }
+    return [changed / counted, best.toDouble()];
+  }
+
+  Future<void> _motionTick() async {
+    final now = DateTime.now();
+    if (_autoRec && !_recording) _autoRec = false;
+    // auto-recording ends 15 s after the last movement
+    if (_autoRec && _recording && now.difference(_lastMotion).inSeconds > 15) {
+      _autoRec = false;
+      await _toggleRec();
+      _sendRec();
+    }
+    if (_motionNow && now.difference(_lastMotion).inSeconds >= 3) {
+      if (mounted) setState(() => _motionNow = false);
+    }
+    if (!_mOn || !_inSchedule() || _motionBusy || _stream == null) return;
+    final tracks = _stream!.getVideoTracks();
+    if (tracks.isEmpty) return;
+    _motionBusy = true;
+    try {
+      final buf = await tracks.first.captureFrame();
+      final png = buf.asUint8List();
+      final cur = await _gray(png, 64);
+      if (cur == null) return;
+      final prev = _prevG;
+      _prevG = cur.g;
+      if (prev == null || _gw != cur.w || _gh != cur.h) {
+        _gw = cur.w;
+        _gh = cur.h;
+        return;
+      }
+      final r = _analyze(prev, cur.g, cur.w, cur.h);
+      final frac = r[0];
+      final blob = r[1];
+      final minFrac = const [0.04, 0.02, 0.01][_mSens];
+      bool hit;
+      if (frac > 0.6) {
+        hit = false; // lights switched / camera moved
+      } else if (_mFilter) {
+        hit = frac >= minFrac && blob >= max(10.0, cur.w * cur.h * 0.008);
+      } else {
+        hit = frac >= minFrac * 0.5;
+      }
+      _streak = hit ? _streak + 1 : 0;
+      if (_streak < (_mFilter ? 2 : 1)) return;
+
+      if (_mPerson && kPersonSupported) {
+        // movement only counts when a person is really in the picture
+        final isPerson = await detectPerson(png);
+        if (!isPerson) return;
+      }
+      _lastMotion = now;
+      if (mounted && !_motionNow) setState(() => _motionNow = true);
+      await _autoRecStart();
+      if (now.difference(_lastAlert).inSeconds >= _alertGap) {
+        _lastAlert = now;
+        await _emitEvent('motion', png, now);
+      }
+    } catch (_) {
+    } finally {
+      _motionBusy = false;
+    }
+  }
+
+  /// Snapshots are kept on the camera phone too (last 50).
+  Future<void> _saveEvent(Uint8List img, DateTime t, String kind,
+      [String suffix = '']) async {
+    try {
+      final base = await getApplicationDocumentsDirectory();
+      final dir = Directory('${base.path}/events');
+      if (!await dir.exists()) await dir.create(recursive: true);
+      await File('${dir.path}/evt_${fmtFile(t)}_$kind$suffix.png')
+          .writeAsBytes(img);
+      final files = <File>[];
+      await for (final e in dir.list()) {
+        if (e is File) files.add(e);
+      }
+      if (files.length > 100) {
+        files.sort((a, b) => a.path.compareTo(b.path));
+        for (final f in files.take(files.length - 100)) {
+          try {
+            await f.delete();
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+
+  /// Loop recording: delete the oldest recordings above the size limit.
+  Future<void> _enforceLoop() async {
+    if (_mLoop <= 0 || !Platform.isAndroid) return;
+    try {
+      final dir = await getExternalStorageDirectory() ??
+          await getApplicationDocumentsDirectory();
+      final files = <File>[];
+      await for (final e in dir.list()) {
+        if (e is File && RegExp(r'cam_.*\.(mp4|srt)$').hasMatch(e.path)) {
+          files.add(e);
+        }
+      }
+      final stats = <String, FileStat>{};
+      var total = 0;
+      for (final f in files) {
+        final st = await f.stat();
+        stats[f.path] = st;
+        total += st.size;
+      }
+      final limit = _mLoop * 1024 * 1024;
+      if (total <= limit) return;
+      files.sort(
+          (a, b) => stats[a.path]!.modified.compareTo(stats[b.path]!.modified));
+      final cur = _recPath;
+      final curSrt = cur?.replaceFirst(RegExp(r'\.mp4$'), '.srt');
+      for (final f in files) {
+        if (total <= limit * 0.9) break;
+        if (_recording && (f.path == cur || f.path == curSrt)) continue;
+        total -= stats[f.path]!.size;
+        try {
+          await f.delete();
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  // ───────────── schedule / events / sound / siren / power saving ─────────────
+  bool _inSchedule() {
+    if (!_sched) return true;
+    final h = DateTime.now().hour;
+    return _sSh <= _sEh ? (h >= _sSh && h < _sEh) : (h >= _sSh || h < _sEh);
+  }
+
+  Future<void> _autoRecStart() async {
+    if (!_mRec || !Platform.isAndroid) return;
+    if (_rolling) {
+      // the pre-roll segment becomes the event recording
+      _rolling = false;
+      _autoRec = true;
+      if (mounted) setState(() {});
+      _sendRec();
+      return;
+    }
+    if (!_recording) {
+      _autoRec = true;
+      await _toggleRec();
+      _sendRec();
+    }
+  }
+
+  /// Pre-motion recording: a rolling 10 s segment is always being recorded and
+  /// thrown away; when movement is detected the running one is kept.
+  Future<void> _preTick() async {
+    if (_preBusy) return;
+    _preBusy = true;
+    try {
+      final want = _pre &&
+          _mRec &&
+          _mOn &&
+          _inSchedule() &&
+          Platform.isAndroid &&
+          _stream != null &&
+          !_autoRec;
+      if (!want) {
+        if (_rolling) await _dropRolling();
+        return;
+      }
+      if (!_recording) {
+        _rolling = true;
+        _rollStart = DateTime.now();
+        await _toggleRec();
+        return;
+      }
+      if (_rolling && DateTime.now().difference(_rollStart).inSeconds >= 10) {
+        await _dropRolling();
+        _rolling = true;
+        _rollStart = DateTime.now();
+        await _toggleRec();
+      }
+    } catch (_) {
+      _rolling = false;
+    } finally {
+      _preBusy = false;
+    }
+  }
+
+  Future<void> _dropRolling() async {
+    final p = _recPath;
+    _rolling = false;
+    await _toggleRec(); // stops
+    if (p != null) {
+      try {
+        await File(p).delete();
+      } catch (_) {}
+      try {
+        await File(p.replaceFirst(RegExp(r'\.mp4$'), '.srt')).delete();
+      } catch (_) {}
+    }
+  }
+
+  /// Snapshot + alert to the viewer; a second "after" snapshot follows 3 s later.
+  Future<void> _emitEvent(String kind, Uint8List? png, DateTime t) async {
+    Uint8List? th;
+    if (png != null) th = await _thumb(png);
+    if (th != null) _saveEvent(th, t, kind);
+    final ts = t.millisecondsSinceEpoch;
+    try {
+      _ws?.add(jsonEncode({
+        'type': 'motion',
+        'kind': kind,
+        'ts': ts,
+        if (th != null) 'img': base64Encode(th),
+      }));
+    } catch (_) {}
+    Future.delayed(const Duration(seconds: 3), () async {
+      try {
+        final tr = _stream?.getVideoTracks();
+        if (tr == null || tr.isEmpty) return;
+        final p2 = (await tr.first.captureFrame()).asUint8List();
+        final th2 = await _thumb(p2);
+        if (th2 == null) return;
+        _saveEvent(th2, t, kind, '_b');
+        _ws?.add(jsonEncode({
+          'type': 'motion',
+          'kind': kind,
+          'ts': ts,
+          'img2': base64Encode(th2),
+        }));
+      } catch (_) {}
+    });
+  }
+
+  void _closeProbe() {
+    final a = _probeA;
+    final b = _probeB;
+    _probeA = null;
+    _probeB = null;
+    a?.close();
+    b?.close();
+  }
+
+  /// A private loop-back connection just to read the microphone level
+  /// (works even when nobody is watching).
+  Future<void> _ensureProbe() async {
+    if (_probeA != null) return;
+    final st = _stream;
+    if (st == null) return;
+    final at = st.getAudioTracks();
+    if (at.isEmpty) {
+      if (_soundOk != false) {
+        _soundOk = false;
+        _sendCfg();
+      }
+      return;
+    }
+    try {
+      final conf = <String, dynamic>{
+        'sdpSemantics': 'unified-plan',
+        'iceServers': <Map<String, dynamic>>[],
+      };
+      final a = await createPeerConnection(conf);
+      final b = await createPeerConnection(conf);
+      _probeA = a;
+      _probeB = b;
+      a.onIceCandidate = (c) {
+        b.addCandidate(c).catchError((_) {});
+      };
+      b.onIceCandidate = (c) {
+        a.addCandidate(c).catchError((_) {});
+      };
+      await a.addTrack(at.first, st);
+      final offer = await a.createOffer();
+      await a.setLocalDescription(offer);
+      await b.setRemoteDescription(offer);
+      final ans = await b.createAnswer();
+      await b.setLocalDescription(ans);
+      await a.setRemoteDescription(ans);
+    } catch (_) {
+      _soundOk = false;
+      _closeProbe();
+      _sendCfg();
+    }
+  }
+
+  Future<void> _soundTick() async {
+    if (!_sOn || !_inSchedule()) {
+      if (_probeA != null) _closeProbe();
+      return;
+    }
+    await _ensureProbe();
+    final a = _probeA;
+    if (a == null) return;
+    var lvl = -1.0;
+    try {
+      for (final r in await a.getStats()) {
+        final v = r.values;
+        final audio = '${v['kind'] ?? v['mediaType']}' == 'audio';
+        if ((r.type == 'media-source' || r.type == 'track') &&
+            audio &&
+            v['audioLevel'] != null) {
+          lvl = max(lvl, numOf(v['audioLevel']));
+        }
+      }
+    } catch (_) {
+      return;
+    }
+    if (lvl < 0) {
+      _noLevel++;
+      if (_noLevel > 20 && _soundOk != false) {
+        _soundOk = false; // this phone does not report the mic level
+        _sendCfg();
+      }
+      return;
+    }
+    if (_soundOk != true) {
+      _soundOk = true;
+      _sendCfg();
+    }
+    final mult = const [5.0, 3.5, 2.2][_mSens];
+    final minL = const [0.12, 0.08, 0.05][_mSens];
+    final thr = max(minL, _ambient * mult);
+    if (lvl > thr) {
+      _loudStreak++;
+    } else {
+      _loudStreak = 0;
+      _ambient = _ambient * 0.9 + lvl * 0.1;
+    }
+    if (_loudStreak < 2) return;
+    _loudStreak = 0;
+    final now = DateTime.now();
+    if (now.difference(_lastSound).inSeconds < _alertGap) return;
+    _lastSound = now;
+    _lastMotion = now;
+    await _autoRecStart();
+    Uint8List? png;
+    final tr = _stream?.getVideoTracks();
+    if (tr != null && tr.isNotEmpty) {
+      try {
+        png = (await tr.first.captureFrame()).asUint8List();
+      } catch (_) {}
+    }
+    await _emitEvent('sound', png, now);
+  }
+
+  void _setSiren(bool on) {
+    _sirenTimer?.cancel();
+    if (!on) return;
+    var n = 0;
+    _sirenTimer = Timer.periodic(const Duration(milliseconds: 700), (t) {
+      SystemSound.play(SystemSoundType.alert);
+      HapticFeedback.vibrate();
+      if (++n > 20) t.cancel();
+    });
+  }
+
+  /// Power saving: black screen when nobody watches / records for a minute.
+  void _idleTick() {
+    if (!_idleDim) {
+      if (_dim && mounted) setState(() => _dim = false);
+      return;
+    }
+    final busy = _ws != null || _recShown;
+    if (busy) {
+      _idleSince = null;
+      if (_dim && mounted) setState(() => _dim = false);
+      return;
+    }
+    _idleSince ??= DateTime.now();
+    if (!_dim && DateTime.now().difference(_idleSince!).inSeconds > 60) {
+      if (mounted) setState(() => _dim = true);
+    }
+  }
+
+  Future<Directory> _recDirectory() async =>
+      (Platform.isAndroid ? await getExternalStorageDirectory() : null) ??
+      await getApplicationDocumentsDirectory();
+
+  /// Library API for the viewer (recordings + event snapshots), PIN protected.
+  Future<void> _http(HttpRequest req) async {
+    final remote = req.connectionInfo?.remoteAddress.address ?? '?';
+    final res = req.response;
+    try {
+      final path = req.uri.path;
+      if (!path.startsWith('/lib/')) {
+        res.write('LAN Cam');
+        await res.close();
+        return;
+      }
+      if (_locked(remote)) {
+        res.statusCode = 429;
+        await res.close();
+        return;
+      }
+      final q = req.uri.queryParameters;
+      if (q['pin'] != _pin) {
+        _fails.putIfAbsent(remote, () => []).add(DateTime.now());
+        res.statusCode = 403;
+        await res.close();
+        return;
+      }
+      _fails.remove(remote);
+      final recDir = await _recDirectory();
+      final evtDir =
+          Directory('${(await getApplicationDocumentsDirectory()).path}/events');
+      if (path == '/lib/list') {
+        final items = <Map<String, dynamic>>[];
+        if (await recDir.exists()) {
+          await for (final e in recDir.list()) {
+            if (e is File && RegExp(r'cam_[^/]*\.mp4$').hasMatch(e.path)) {
+              final st = await e.stat();
+              items.add({
+                'k': 'rec',
+                'n': e.path.split('/').last,
+                's': st.size,
+                't': st.modified.millisecondsSinceEpoch,
+              });
+            }
+          }
+        }
+        if (await evtDir.exists()) {
+          await for (final e in evtDir.list()) {
+            if (e is File &&
+                e.path.endsWith('.png') &&
+                !e.path.endsWith('_b.png')) {
+              final st = await e.stat();
+              items.add({
+                'k': 'evt',
+                'n': e.path.split('/').last,
+                's': st.size,
+                't': st.modified.millisecondsSinceEpoch,
+              });
+            }
+          }
+        }
+        res.headers.contentType = ContentType.json;
+        res.write(jsonEncode(items));
+        await res.close();
+        return;
+      }
+      final name = q['n'] ?? '';
+      final kind = q['k'] ?? '';
+      if (name.isEmpty || name.contains('/') || name.contains('..')) {
+        res.statusCode = 400;
+        await res.close();
+        return;
+      }
+      final dir = kind == 'evt' ? evtDir : recDir;
+      final f = File('${dir.path}/$name');
+      if (path == '/lib/file') {
+        if (!await f.exists()) {
+          res.statusCode = 404;
+          await res.close();
+          return;
+        }
+        res.headers.contentType = ContentType.binary;
+        res.contentLength = await f.length();
+        await res.addStream(f.openRead());
+        await res.close();
+        return;
+      }
+      if (path == '/lib/del') {
+        try {
+          if (await f.exists()) await f.delete();
+          if (kind == 'rec') {
+            final srt = File(f.path.replaceFirst(RegExp(r'\.mp4$'), '.srt'));
+            if (await srt.exists()) await srt.delete();
+          } else {
+            final b = File(f.path.replaceFirst(RegExp(r'\.png$'), '_b.png'));
+            if (await b.exists()) await b.delete();
+          }
+        } catch (_) {}
+        res.write('ok');
+        await res.close();
+        return;
+      }
+      res.statusCode = 404;
+      await res.close();
+    } catch (_) {
+      try {
+        res.statusCode = 500;
+        await res.close();
+      } catch (_) {}
+    }
   }
 
   void _showQr() {
@@ -1512,6 +2591,14 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         case 'nav':
           await _svc.invokeMethod('nav', {'action': d['action']});
           break;
+        case 'touch':
+          // normalised 0..1 (the phone may rotate at any time)
+          _svc.invokeMethod('touch', {
+            'a': d['a'],
+            'x': (d['x'] as num).toDouble(),
+            'y': (d['y'] as num).toDouble(),
+          });
+          break;
       }
     } catch (_) {}
   }
@@ -1520,9 +2607,9 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     final cfg = await loadSettings();
     try {
       await _svc.invokeMethod('screenConfig', {
-        'fps': (cfg['sfps'] as int?) ?? 10,
-        'quality': (cfg['squality'] as int?) ?? 60,
-        'maxSide': (cfg['sside'] as int?) ?? 1280,
+        'fps': (cfg['sfps'] as int?) ?? 60,
+        'quality': (cfg['squality'] as int?) ?? 50,
+        'maxSide': (cfg['sside'] as int?) ?? 960,
       });
       await _svc.invokeMethod('screenStart');
     } catch (_) {}
@@ -1575,6 +2662,14 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
 
   /// Remote controls from the viewer: switch camera / flashlight.
   Future<void> _cmd(Map<String, dynamic> d) async {
+    if (d['cmd'] == 'cfg') {
+      _applyCfg(d);
+      return;
+    }
+    if (d['cmd'] == 'siren') {
+      _setSiren(d['on'] == true);
+      return;
+    }
     if (d['cmd'] == 'range') {
       _range = d['on'] == true;
       saveSettings({'range': _range});
@@ -1598,13 +2693,19 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
 
   void _sendRec({bool ok = true}) {
     try {
-      _ws?.add(jsonEncode({'type': 'rec', 'on': _recording, 'ok': ok}));
+      _ws?.add(jsonEncode({'type': 'rec', 'on': _recShown, 'ok': ok}));
     } catch (_) {}
   }
 
   Future<void> _setRec(bool on) async {
     if (!Platform.isAndroid) {
       _sendRec(ok: false);
+      return;
+    }
+    _autoRec = false;
+    if (_rolling) {
+      if (on && mounted) setState(() => _rolling = false);
+      _sendRec();
       return;
     }
     if (on != _recording) await _toggleRec();
@@ -1617,6 +2718,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       await _rec?.stop();
       await _stopSrt();
       if (mounted) setState(() => _recording = false);
+      _enforceLoop();
       return;
     }
     final dir = await getExternalStorageDirectory() ??
@@ -1627,6 +2729,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     await _rec!.start(path,
         videoTrack: _stream!.getVideoTracks().first,
         audioChannel: RecorderAudioChannel.INPUT);
+    _recPath = path;
     // subtitle file with the date/time (players show it next to the video)
     _startSrt(path.replaceFirst(RegExp(r'\.mp4$'), '.srt'), t0);
     if (mounted) setState(() => _recording = true);
@@ -1639,6 +2742,12 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     _healthTimer?.cancel();
     _adaptTimer?.cancel();
     _clockTimer?.cancel();
+    _motionTimer?.cancel();
+    _loopTimer?.cancel();
+    _soundTimer?.cancel();
+    _preTimer?.cancel();
+    _sirenTimer?.cancel();
+    _closeProbe();
     _now.dispose();
     _stopSrt();
     _screenSub?.cancel();
@@ -1822,7 +2931,51 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
               label: const Text('عرض رمز QR للربط'),
               onPressed: _showQr,
             ),
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                  kTls ? 'الاتصال مشفّر (TLS)' : 'الاتصال غير مشفّر — أضف شهادة TLS في البناء',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                      fontSize: 11, color: kTls ? kGreen : Colors.amber)),
+            ),
             const SizedBox(height: 10),
+            Container(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              decoration: BoxDecoration(
+                color: kBg,
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: SwitchListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: const Text('كشف الحركة',
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+                subtitle: const Text('الإعدادات الكاملة من جهاز المشاهدة (زر الأمان)',
+                    style: TextStyle(fontSize: 11, color: Colors.white54)),
+                value: _mOn,
+                onChanged: (v) => _applyCfg({'on': v}),
+              ),
+            ),
+            Container(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              decoration: BoxDecoration(
+                color: kBg,
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: SwitchListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: const Text('توفير الطاقة',
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+                subtitle: const Text('شاشة سوداء إذا لم يشاهد أحد لمدة دقيقة',
+                    style: TextStyle(fontSize: 11, color: Colors.white54)),
+                value: _idleDim,
+                onChanged: (v) => _applyCfg({'idle': v}),
+              ),
+            ),
             if (Platform.isAndroid)
               Container(
                 margin: const EdgeInsets.only(bottom: 10),
@@ -1847,14 +3000,21 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
             if (Platform.isAndroid)
               FilledButton.icon(
                 style: FilledButton.styleFrom(
-                  backgroundColor: _recording ? kRed : null,
+                  backgroundColor: _recShown ? kRed : null,
                   minimumSize: const Size.fromHeight(46),
                   shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(14)),
                 ),
-                icon: Icon(_recording ? Icons.stop_rounded : Icons.fiber_manual_record),
-                label: Text(_recording ? 'إيقاف التسجيل' : 'تسجيل'),
+                icon: Icon(_recShown ? Icons.stop_rounded : Icons.fiber_manual_record),
+                label: Text(_recShown ? 'إيقاف التسجيل' : 'تسجيل'),
                 onPressed: () async {
+                  _autoRec = false;
+                  if (_rolling) {
+                    // keep the running pre-roll segment as a normal recording
+                    setState(() => _rolling = false);
+                    _sendRec();
+                    return;
+                  }
                   await _toggleRec();
                   _sendRec();
                 },
@@ -1877,9 +3037,12 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         borderRadius: BorderRadius.circular(20),
         child: Stack(fit: StackFit.expand, children: [
           Container(color: Colors.black),
-          RTCVideoView(_local),
+          if (!_dim) RTCVideoView(_local),
           if (_clockOn)
             Positioned(left: 10, bottom: 10, child: ClockStamp(time: _now)),
+          if (_motionNow)
+            const Positioned(
+                left: 10, top: 10, child: Pill(color: kRed, text: 'حركة')),
           Positioned(
             top: 10,
             right: 10,
@@ -1887,7 +3050,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
               Pill(
                   color: _live ? kRed : Colors.grey,
                   text: _live ? 'LIVE' : 'STANDBY'),
-              if (_recording) ...[
+              if (_recShown) ...[
                 const SizedBox(width: 8),
                 const Pill(color: kRed, text: 'REC'),
               ],
@@ -1902,7 +3065,27 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       );
 
   @override
-  Widget build(BuildContext context) => Scaffold(
+  Widget build(BuildContext context) => Stack(children: [
+        _buildMain(),
+        if (_dim)
+          Positioned.fill(
+            child: Material(
+              color: Colors.black,
+              child: InkWell(
+                onTap: () => setState(() {
+                  _dim = false;
+                  _idleSince = DateTime.now();
+                }),
+                child: const Center(
+                  child: Text('وضع توفير الطاقة — المس الشاشة',
+                      style: TextStyle(color: Colors.white24, fontSize: 12)),
+                ),
+              ),
+            ),
+          ),
+      ]);
+
+  Widget _buildMain() => Scaffold(
         body: SafeArea(
           child: Padding(
             padding: const EdgeInsets.all(10),
@@ -1988,12 +3171,35 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
   int _night = 0;
   bool _clockOn = true;
   bool _range = false;
+  int _alertBat = 20;
+  int _alertTemp = 45;
+  bool _alertSnd = true;
+  bool _alertHap = true;
+  bool _autoRetry = true;
   int _prevLost = 0;
   int _prevRecv = 0;
   bool _alertedBat20 = false;
   bool _alertedBat10 = false;
   bool _alertedTemp = false;
   final _tc = TransformationController();
+  // phone-screen mirror: auto orientation, hide-able buttons, live touch
+  bool? _screenLand;
+  final _uiImg = ValueNotifier<ui.Image?>(null);
+  bool _decoding = false;
+  Uint8List? _pendingFrame;
+  final _touchPos = ValueNotifier<Offset?>(null);
+  int? _ptr;
+  DateTime _lastMove = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _barOn = false;
+  Timer? _barTimer;
+  // security (motion / zones / events)
+  Map<String, dynamic> _cfg = {};
+  final List<_Evt> _events = [];
+  int _unread = 0;
+  bool _zoneEdit = false;
+  List<bool> _zEdit = List<bool>.filled(48, false);
+  String _zEditMode = 'ignore';
+  bool? _zPaint;
 
   RTCVideoViewObjectFit get _fit => _fitCover
       ? RTCVideoViewObjectFit.RTCVideoViewObjectFitCover
@@ -2021,7 +3227,14 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
         _night = (s['night'] as int?) ?? 0;
         _clockOn = (s['clock'] as bool?) ?? true;
         _range = (s['range'] as bool?) ?? false;
+        _alertBat = (s['alertBat'] as int?) ?? 20;
+        _alertTemp = (s['alertTemp'] as int?) ?? 45;
+        _alertSnd = (s['alertSound'] as bool?) ?? true;
+        _alertHap = (s['alertHaptic'] as bool?) ?? true;
+        _autoRetry = (s['autoRetry'] as bool?) ?? true;
+        _muted = s['muteStart'] == true;
       });
+      if (s['keepOn'] == false) WakelockPlus.disable();
       if (widget.autoConnect && widget.initialIp != null) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) _connect();
@@ -2092,6 +3305,14 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
 
   void _scheduleRetry([String? why]) {
     if (!_wantLive || _denied || !mounted) return;
+    if (!_autoRetry) {
+      _wantLive = false;
+      setState(() {
+        _isConnected = false;
+        _status = '${why ?? 'انقطع الاتصال'} — إعادة الاتصال التلقائية معطّلة';
+      });
+      return;
+    }
     if (_retryTimer?.isActive == true) return;
     _retryN++;
     final secs = min(10, 1 + _retryN * 2);
@@ -2170,8 +3391,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
       _ws = null;
       await oldPc?.close();
       oldWs?.close();
-      final ws = _ws = await WebSocket.connect('ws://$ip:$kPort')
-          .timeout(const Duration(seconds: 5));
+      final ws = _ws = await openWs(ip).timeout(const Duration(seconds: 5));
 
       // Microphone (talk-back to the camera). Starts muted.
       if (_micTrack == null) {
@@ -2262,6 +3482,12 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
           case 'health':
             _onHealth(d as Map);
             break;
+          case 'cfg':
+            if (mounted) setState(() => _cfg = Map<String, dynamic>.from(d));
+            break;
+          case 'motion':
+            _onMotion(d as Map);
+            break;
           case 'denied':
             _denied = true;
             _wantLive = false;
@@ -2299,8 +3525,8 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
   }
 
   void _alert(String m) {
-    HapticFeedback.heavyImpact();
-    SystemSound.play(SystemSoundType.alert);
+    if (_alertHap) HapticFeedback.heavyImpact();
+    if (_alertSnd) SystemSound.play(SystemSoundType.alert);
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text(m),
@@ -2318,24 +3544,24 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
     final bat = m['bat'];
     final chg = m['chg'] == true;
     if (bat is num) {
-      if (chg || bat > 25) {
+      if (chg || bat > _alertBat + 5) {
         _alertedBat20 = false;
         _alertedBat10 = false;
-      } else if (bat <= 10 && !_alertedBat10) {
+      } else if (bat <= _alertBat ~/ 2 && !_alertedBat10) {
         _alertedBat10 = true;
         _alertedBat20 = true;
         _alert('بطارية الكاميرا ${bat.toInt()}% — وصّلها بالشاحن');
-      } else if (bat <= 20 && !_alertedBat20) {
+      } else if (bat <= _alertBat && !_alertedBat20) {
         _alertedBat20 = true;
         _alert('بطارية الكاميرا منخفضة ${bat.toInt()}%');
       }
     }
     final t = m['temp'];
     if (t is num) {
-      if (t >= 45 && !_alertedTemp) {
+      if (t >= _alertTemp && !_alertedTemp) {
         _alertedTemp = true;
         _alert('حرارة جهاز الكاميرا مرتفعة ${t.toStringAsFixed(0)}°');
-      } else if (t < 41) {
+      } else if (t < _alertTemp - 4) {
         _alertedTemp = false;
       }
     }
@@ -2344,9 +3570,25 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
   }
 
   /// Link quality as measured on this phone (RTT + packet loss).
+  int _thumbTick = 0;
+
+  /// Keep a small last-seen picture per camera (used by the multi-camera grid).
+  Future<void> _saveThumb() async {
+    try {
+      final tr = _remote.srcObject?.getVideoTracks();
+      if (tr == null || tr.isEmpty) return;
+      final png = (await tr.first.captureFrame()).asUint8List();
+      final th = await pngThumb(png, 360);
+      if (th == null) return;
+      await (await thumbFile(_ipCtl.text.trim())).writeAsBytes(th);
+      kThumbRev.value++;
+    } catch (_) {}
+  }
+
   Future<void> _pollStats() async {
     final pc = _pc;
     if (pc == null || !_isConnected || widget.screen) return;
+    if (_thumbTick++ % 15 == 5) _saveThumb();
     var rtt = 0.0;
     var lost = 0;
     var recv = 0;
@@ -2497,6 +3739,9 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
   Widget _videoView() {
     Widget v = RTCVideoView(_remote, objectFit: _fit);
     if (_night > 0) v = ColorFiltered(colorFilter: _nightFilter(), child: v);
+    if (_zoneEdit) {
+      return Stack(fit: StackFit.expand, children: [v, _zoneOverlay()]);
+    }
     return GestureDetector(
       onDoubleTap: () => _tc.value = Matrix4.identity(),
       child: InteractiveViewer(
@@ -2504,6 +3749,460 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
         minScale: 1,
         maxScale: 6,
         child: v,
+      ),
+    );
+  }
+
+  void _onMotion(Map d) {
+    try {
+      final ts = (d['ts'] as num).toInt();
+      final kind = '${d['kind'] ?? 'motion'}';
+      if (d['img2'] != null) {
+        final i = _events.indexWhere((e) => e.t.millisecondsSinceEpoch == ts);
+        if (i >= 0) {
+          _events[i].img2 = base64Decode('${d['img2']}');
+          if (mounted) setState(() {});
+        }
+        return;
+      }
+      final img = d['img'] != null ? base64Decode('${d['img']}') : Uint8List(0);
+      _events.insert(
+          0, _Evt(DateTime.fromMillisecondsSinceEpoch(ts), img, kind));
+      if (_events.length > 30) _events.removeLast();
+      _unread++;
+      _alert(kind == 'sound'
+          ? 'صوت عالٍ عند الكاميرا'
+          : 'حركة مكتشفة في الكاميرا');
+    } catch (_) {}
+  }
+
+  void _cfgSend(Map<String, dynamic> patch) {
+    setState(() => _cfg = {..._cfg, ...patch});
+    _send({'type': 'cmd', 'cmd': 'cfg', ...patch});
+  }
+
+  Rect _videoRect(Size box) {
+    final vw = _remote.videoWidth;
+    final vh = _remote.videoHeight;
+    if (vw <= 0 || vh <= 0 || _fitCover) {
+      return Rect.fromLTWH(0, 0, box.width, box.height);
+    }
+    final sc = min(box.width / vw, box.height / vh);
+    final w = vw * sc;
+    final h = vh * sc;
+    return Rect.fromLTWH((box.width - w) / 2, (box.height - h) / 2, w, h);
+  }
+
+  /// Paint the detection zones over the live picture (8 x 6 grid).
+  Widget _zoneOverlay() => LayoutBuilder(builder: (context, c) {
+        final r = _videoRect(Size(c.maxWidth, c.maxHeight));
+        final cw = r.width / 8;
+        final chh = r.height / 6;
+        int? idx(Offset p) {
+          final x = ((p.dx - r.left) / cw).floor();
+          final y = ((p.dy - r.top) / chh).floor();
+          if (x < 0 || x >= 8 || y < 0 || y >= 6) return null;
+          return y * 8 + x;
+        }
+
+        void paintAt(Offset p) {
+          final i = idx(p);
+          final v = _zPaint;
+          if (i == null || v == null) return;
+          if (_zEdit[i] != v) setState(() => _zEdit[i] = v);
+        }
+
+        final col = _zEditMode == 'ignore'
+            ? const Color(0x66EF4444)
+            : const Color(0x6622C55E);
+        return Stack(fit: StackFit.expand, children: [
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTapUp: (d) {
+              final i = idx(d.localPosition);
+              if (i != null) setState(() => _zEdit[i] = !_zEdit[i]);
+            },
+            onPanStart: (d) {
+              final i = idx(d.localPosition);
+              if (i == null) return;
+              _zPaint = !_zEdit[i];
+              paintAt(d.localPosition);
+            },
+            onPanUpdate: (d) => paintAt(d.localPosition),
+            child: Stack(children: [
+              for (var i = 0; i < 48; i++)
+                Positioned(
+                  left: r.left + (i % 8) * cw,
+                  top: r.top + (i ~/ 8) * chh,
+                  width: cw,
+                  height: chh,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: _zEdit[i] ? col : Colors.transparent,
+                      border: Border.all(color: Colors.white24, width: 0.5),
+                    ),
+                  ),
+                ),
+            ]),
+          ),
+          Positioned(
+            top: 6,
+            left: 6,
+            right: 6,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: const Color(0xCC000000),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Wrap(
+                alignment: WrapAlignment.center,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                spacing: 6,
+                children: [
+                  ChoiceChip(
+                    label: const Text('تجاهل المناطق', style: TextStyle(fontSize: 11)),
+                    selected: _zEditMode == 'ignore',
+                    onSelected: (_) => setState(() => _zEditMode = 'ignore'),
+                  ),
+                  ChoiceChip(
+                    label: const Text('مراقبة المناطق فقط', style: TextStyle(fontSize: 11)),
+                    selected: _zEditMode == 'only',
+                    onSelected: (_) => setState(() => _zEditMode = 'only'),
+                  ),
+                  TextButton(
+                    onPressed: () =>
+                        setState(() => _zEdit = List<bool>.filled(48, false)),
+                    child: const Text('مسح'),
+                  ),
+                  FilledButton(
+                    onPressed: () {
+                      _cfgSend({
+                        'zmask': _zEdit.map((e) => e ? '1' : '0').join(),
+                        'zmode': _zEditMode,
+                      });
+                      setState(() => _zoneEdit = false);
+                    },
+                    child: const Text('تم'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ]);
+      });
+
+  void _security() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kSurface,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setM) {
+          void cfg(Map<String, dynamic> p) {
+            _cfgSend(p);
+            setM(() {});
+          }
+
+          final sens = ((_cfg['sens'] as num?) ?? 1).toInt();
+          final loop = ((_cfg['loop'] as num?) ?? 0).toInt();
+          final android = _cfg['android'] != false;
+          return SafeArea(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('الأمان والمراقبة الذكية',
+                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('كشف الحركة'),
+                      subtitle: const Text('تنبيه مع لقطة عند وجود حركة',
+                          style: TextStyle(fontSize: 11, color: Colors.white54)),
+                      value: _cfg['on'] == true,
+                      onChanged: (v) => cfg({'on': v}),
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('تسجيل تلقائي عند الحركة'),
+                      subtitle: Text(
+                          android
+                              ? 'يبدأ عند الحركة ويتوقف بعد 15 ث من آخر حركة'
+                              : 'غير متاح: جهاز الكاميرا لا يدعم التسجيل (Android فقط)',
+                          style: const TextStyle(fontSize: 11, color: Colors.white54)),
+                      value: _cfg['rec'] == true,
+                      onChanged: android ? (v) => cfg({'rec': v}) : null,
+                    ),
+                    const SizedBox(height: 4),
+                    const Text('الحساسية'),
+                    Wrap(spacing: 8, children: [
+                      for (var i = 0; i < 3; i++)
+                        ChoiceChip(
+                          label: Text(const ['منخفضة', 'متوسطة', 'عالية'][i]),
+                          selected: sens == i,
+                          onSelected: (_) => cfg({'sens': i}),
+                        ),
+                    ]),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('تصفية الإنذارات الكاذبة'),
+                      subtitle: const Text(
+                          'يتجاهل الحركة الصغيرة (حشرات) وتغيّر الإضاءة والوميض. ليس تعرّفاً على الأشخاص.',
+                          style: TextStyle(fontSize: 11, color: Colors.white54)),
+                      value: _cfg['filter'] != false,
+                      onChanged: (v) => cfg({'filter': v}),
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('تسجيل ما قبل الحركة'),
+                      subtitle: const Text(
+                          'يحتفظ بحتى 10 ث قبل الحركة. يسجّل باستمرار على الكاميرا فيزيد البطارية والكتابة على التخزين (Android فقط، مع التسجيل التلقائي).',
+                          style: TextStyle(fontSize: 11, color: Colors.white54)),
+                      value: _cfg['pre'] == true,
+                      onChanged: (android && _cfg['rec'] == true)
+                          ? (v) => cfg({'pre': v})
+                          : null,
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('اعتماد الأشخاص فقط'),
+                      subtitle: Text(
+                          _cfg['personAvail'] == true
+                              ? 'الحركة تُعتمد فقط إذا ظهر وجه أو جسم شخص في الصورة'
+                              : 'غير مفعّل في هذا الإصدار: شغّل البناء مع خيار ml',
+                          style: const TextStyle(fontSize: 11, color: Colors.white54)),
+                      value: _cfg['person'] == true,
+                      onChanged: _cfg['personAvail'] == true
+                          ? (v) => cfg({'person': v})
+                          : null,
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('كشف الصوت'),
+                      subtitle: Text(
+                          _cfg['sound'] == false
+                              ? 'غير مدعوم: هذا الجهاز لا يعطي مستوى الميكروفون'
+                              : 'تنبيه عند صوت أعلى بكثير من الهدوء المعتاد (بكاء، زجاج، نباح)',
+                          style: const TextStyle(fontSize: 11, color: Colors.white54)),
+                      value: _cfg['son'] == true,
+                      onChanged: (v) => cfg({'son': v}),
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('جدول زمني'),
+                      subtitle: const Text('الحركة والصوت يعملان في هذه الساعات فقط',
+                          style: TextStyle(fontSize: 11, color: Colors.white54)),
+                      value: _cfg['sched'] == true,
+                      onChanged: (v) => cfg({'sched': v}),
+                    ),
+                    if (_cfg['sched'] == true)
+                      Row(children: [
+                        const Text('من'),
+                        const SizedBox(width: 8),
+                        DropdownButton<int>(
+                          value: ((_cfg['sh'] as num?) ?? 22).toInt(),
+                          items: [
+                            for (var h = 0; h < 24; h++)
+                              DropdownMenuItem(value: h, child: Text('${two(h)}:00')),
+                          ],
+                          onChanged: (v) {
+                            if (v != null) cfg({'sh': v});
+                          },
+                        ),
+                        const SizedBox(width: 16),
+                        const Text('إلى'),
+                        const SizedBox(width: 8),
+                        DropdownButton<int>(
+                          value: ((_cfg['eh'] as num?) ?? 6).toInt(),
+                          items: [
+                            for (var h = 0; h < 24; h++)
+                              DropdownMenuItem(value: h, child: Text('${two(h)}:00')),
+                          ],
+                          onChanged: (v) {
+                            if (v != null) cfg({'eh': v});
+                          },
+                        ),
+                      ]),
+                    const Divider(),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.video_library_rounded),
+                      title: const Text('مكتبة التسجيلات والأحداث'),
+                      subtitle: const Text('تصفح وتنزيل وحذف من جهاز الكاميرا',
+                          style: TextStyle(fontSize: 11, color: Colors.white54)),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                                builder: (_) => LibraryPage(
+                                    ip: _ipCtl.text.trim(), pin: _pinCtl.text)));
+                      },
+                    ),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.campaign_rounded),
+                      title: const Text('تشغيل صفارة على الكاميرا'),
+                      subtitle: const Text('نغمة تنبيه واهتزاز لمدة 15 ثانية',
+                          style: TextStyle(fontSize: 11, color: Colors.white54)),
+                      trailing: Wrap(children: [
+                        TextButton(
+                            onPressed: () => _send(
+                                {'type': 'cmd', 'cmd': 'siren', 'on': true}),
+                            child: const Text('تشغيل')),
+                        TextButton(
+                            onPressed: () => _send(
+                                {'type': 'cmd', 'cmd': 'siren', 'on': false}),
+                            child: const Text('إيقاف')),
+                      ]),
+                    ),
+                    const Divider(),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.grid_on_rounded),
+                      title: const Text('تحديد مناطق الكشف'),
+                      subtitle: Text(
+                          _cfg['zmode'] == 'only'
+                              ? 'الوضع: مراقبة المناطق المرسومة فقط'
+                              : 'الوضع: تجاهل المناطق المرسومة',
+                          style: const TextStyle(fontSize: 11, color: Colors.white54)),
+                      onTap: () {
+                        final m = '${_cfg['zmask'] ?? ''}';
+                        setState(() {
+                          _zEdit = List<bool>.generate(
+                              48, (i) => m.length == 48 && m[i] == '1');
+                          _zEditMode = _cfg['zmode'] == 'only' ? 'only' : 'ignore';
+                          _zoneEdit = true;
+                        });
+                        Navigator.pop(ctx);
+                        if (!_wide) _setWide(true);
+                      },
+                    ),
+                    const Divider(),
+                    const Text('تسجيل دوّار (حذف الأقدم تلقائياً)'),
+                    Wrap(spacing: 8, children: [
+                      for (final v in const [0, 1024, 2048, 5120, 10240])
+                        ChoiceChip(
+                          label: Text(v == 0 ? 'إيقاف' : '${v ~/ 1024} GB'),
+                          selected: loop == v,
+                          onSelected: android ? (_) => cfg({'loop': v}) : null,
+                        ),
+                    ]),
+                    if (_cfg['rec'] == true && loop == 0)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 8),
+                        child: Text(
+                            'تنبيه: التسجيل التلقائي بدون تسجيل دوّار قد يملأ التخزين.',
+                            style: TextStyle(fontSize: 11, color: Colors.amber)),
+                      ),
+                  ]),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  void _eventsSheet() {
+    setState(() => _unread = 0);
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kSurface,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        child: SizedBox(
+          height: MediaQuery.of(ctx).size.height * 0.6,
+          child: _events.isEmpty
+              ? const Center(
+                  child: Text('لا توجد أحداث بعد',
+                      style: TextStyle(color: Colors.white54)))
+              : GridView.count(
+                  padding: const EdgeInsets.all(12),
+                  crossAxisCount: 2,
+                  mainAxisSpacing: 10,
+                  crossAxisSpacing: 10,
+                  childAspectRatio: 16 / 10,
+                  children: [
+                    for (final e in _events)
+                      GestureDetector(
+                        onTap: () => _showEvent(e),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: Stack(fit: StackFit.expand, children: [
+                            Image.memory(e.img,
+                                fit: BoxFit.cover,
+                                errorBuilder: (_, __, ___) => Center(
+                                    child: Icon(
+                                        e.kind == 'sound'
+                                            ? Icons.hearing_rounded
+                                            : Icons.image_not_supported_outlined,
+                                        color: Colors.white38))),
+                            Positioned(
+                              left: 0,
+                              right: 0,
+                              bottom: 0,
+                              child: Container(
+                                color: const Color(0x99000000),
+                                padding: const EdgeInsets.all(4),
+                                child: Text(fmtStamp(e.t),
+                                    textDirection: TextDirection.ltr,
+                                    textAlign: TextAlign.center,
+                                    style: const TextStyle(fontSize: 10)),
+                              ),
+                            ),
+                          ]),
+                        ),
+                      ),
+                  ],
+                ),
+        ),
+      ),
+    );
+  }
+
+  void _showEvent(_Evt e) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kSurface,
+        contentPadding: const EdgeInsets.all(10),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Text('لحظة الحدث', style: TextStyle(fontSize: 11, color: Colors.white54)),
+            const SizedBox(height: 4),
+            Image.memory(e.img,
+                errorBuilder: (_, __, ___) => const Padding(
+                    padding: EdgeInsets.all(20),
+                    child: Icon(Icons.hearing_rounded, color: Colors.white38))),
+            if (e.img2 != null) ...[
+              const SizedBox(height: 10),
+              const Text('بعد 3 ثوانٍ',
+                  style: TextStyle(fontSize: 11, color: Colors.white54)),
+              const SizedBox(height: 4),
+              Image.memory(e.img2!),
+            ],
+            const SizedBox(height: 8),
+            Text(fmtStamp(e.t), textDirection: TextDirection.ltr),
+          ]),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () async {
+              try {
+                if (!await Gal.hasAccess()) await Gal.requestAccess();
+                await Gal.putImageBytes(e.img);
+                _snack('تم الحفظ في الصور');
+              } catch (_) {
+                _snack('تعذّر الحفظ');
+              }
+            },
+            child: const Text('حفظ في الصور'),
+          ),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('إغلاق')),
+        ],
       ),
     );
   }
@@ -2525,8 +4224,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
     _ws = null; // so the old socket's onDone is ignored
     oldWs?.close();
     _frame = null;
-    final ws = _ws = await WebSocket.connect('ws://$ip:$kPort')
-        .timeout(const Duration(seconds: 5));
+    final ws = _ws = await openWs(ip).timeout(const Duration(seconds: 5));
     ws.listen((m) {
       if (!mounted) return;
       if (m is String) {
@@ -2543,9 +4241,9 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
                   ? 'متصل — التحكم مفعّل'
                   : 'متصل — عرض فقط (فعّل التحكم على الجهاز الآخر)';
             });
-            if (_autoWide && !_autoWideDone) {
-              _autoWideDone = true;
-              _setWide(true);
+            if (_sw > 0 && _sh > 0 && _screenLand == null) {
+              _screenLand = _sw > _sh;
+              _screenOrient(_screenLand!);
             }
             break;
           case 'screen_error':
@@ -2566,13 +4264,29 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
             break;
         }
       } else if (m is List<int>) {
-        setState(() => _frame = m is Uint8List ? m : Uint8List.fromList(m));
+        final b = m is Uint8List ? m : Uint8List.fromList(m);
+        if (b.length < 8) return;
+        final fw = (b[0] << 8) | b[1];
+        final fh = (b[2] << 8) | b[3];
+        if (fw != _sw || fh != _sh) {
+          _sw = fw;
+          _sh = fh;
+          final land = fw > fh; // the other phone is in landscape (game/video)
+          if (_screenLand != land) {
+            _screenLand = land;
+            _screenOrient(land);
+          }
+        }
+        _pendingFrame = Uint8List.sublistView(b, 4);
+        _decodeLoop(); // newest frame wins: no queue, minimal latency
       }
     }, onDone: () {
       if (mounted && !_denied && identical(_ws, ws)) {
         if (_isConnected) _alert('انقطع الاتصال بشاشة الهاتف — جاري إعادة الاتصال');
         _isConnected = false;
         _ws = null;
+        _screenLand = null;
+        _portrait();
         _scheduleRetry();
       }
     });
@@ -2592,72 +4306,188 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
     return Offset(nx, ny);
   }
 
-  /// The other phone's screen, with touch -> remote tap / swipe / long-press.
+  Future<void> _screenOrient(bool land) async {
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    await SystemChrome.setPreferredOrientations(land
+        ? [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]
+        : [DeviceOrientation.portraitUp]);
+  }
+
+  Offset _normClamp(Offset p, Size box) {
+    if (_sw == 0 || _sh == 0) return Offset.zero;
+    final sc = min(box.width / _sw, box.height / _sh);
+    final dw = _sw * sc;
+    final dh = _sh * sc;
+    final ox = (box.width - dw) / 2;
+    final oy = (box.height - dh) / 2;
+    return Offset(((p.dx - ox) / dw).clamp(0.0, 1.0).toDouble(),
+        ((p.dy - oy) / dh).clamp(0.0, 1.0).toDouble());
+  }
+
+  void _endTouch(PointerEvent e, Size box) {
+    if (e.pointer != _ptr) return;
+    _ptr = null;
+    _touchPos.value = null;
+    final n = _normClamp(e.localPosition, box);
+    _send({'type': 'touch', 'a': 'u', 'x': n.dx, 'y': n.dy});
+  }
+
+  /// The other phone's screen. Raw pointer events: the remote stroke follows
+  /// the finger immediately (down / move / up), no tap-vs-drag delay.
   Widget _screenArea() => LayoutBuilder(builder: (context, c) {
         final box = Size(c.maxWidth, c.maxHeight);
-        return GestureDetector(
+        return Listener(
           behavior: HitTestBehavior.opaque,
-          onTapUp: (d) {
-            final n = _toNorm(d.localPosition, box);
-            if (n != null) _send({'type': 'tap', 'x': n.dx, 'y': n.dy});
+          onPointerDown: (e) {
+            if (_ptr != null) return;
+            final n = _toNorm(e.localPosition, box);
+            if (n == null) return;
+            _ptr = e.pointer;
+            _touchPos.value = e.localPosition;
+            _send({'type': 'touch', 'a': 'd', 'x': n.dx, 'y': n.dy});
           },
-          onLongPressStart: (d) {
-            final n = _toNorm(d.localPosition, box);
-            if (n != null) {
-              _send({
-                'type': 'swipe',
-                'x1': n.dx,
-                'y1': n.dy,
-                'x2': n.dx,
-                'y2': n.dy,
-                'ms': 700
-              });
-            }
+          onPointerMove: (e) {
+            if (e.pointer != _ptr) return;
+            _touchPos.value = e.localPosition;
+            final now = DateTime.now();
+            if (now.difference(_lastMove).inMilliseconds < 8) return;
+            _lastMove = now;
+            final n = _normClamp(e.localPosition, box);
+            _send({'type': 'touch', 'a': 'm', 'x': n.dx, 'y': n.dy});
           },
-          onPanStart: (d) {
-            _panStart = d.localPosition;
-            _panLast = d.localPosition;
-            _panT = DateTime.now();
-          },
-          onPanUpdate: (d) => _panLast = d.localPosition,
-          onPanEnd: (d) {
-            final a = _panStart;
-            final b = _panLast;
-            if (a == null || b == null) return;
-            final na = _toNorm(a, box);
-            final nb = _toNorm(b, box);
-            if (na == null || nb == null) return;
-            final ms =
-                DateTime.now().difference(_panT).inMilliseconds.clamp(80, 1200);
-            _send({
-              'type': 'swipe',
-              'x1': na.dx,
-              'y1': na.dy,
-              'x2': nb.dx,
-              'y2': nb.dy,
-              'ms': ms.toInt(),
-            });
-          },
+          onPointerUp: (e) => _endTouch(e, box),
+          onPointerCancel: (e) => _endTouch(e, box),
           child: Stack(fit: StackFit.expand, children: [
             Container(color: Colors.black),
-            if (_frame != null)
-              Image.memory(_frame!,
-                  gaplessPlayback: true,
-                  fit: BoxFit.contain,
-                  errorBuilder: (_, __, ___) => const SizedBox()),
-            if (_frame == null)
-              const Center(
-                child: Column(mainAxisSize: MainAxisSize.min, children: [
-                  Icon(Icons.phone_android_rounded,
-                      size: 40, color: Colors.white24),
-                  SizedBox(height: 8),
-                  Text('لا يوجد بث للشاشة',
-                      style: TextStyle(color: Colors.white38)),
-                ]),
+            ValueListenableBuilder<ui.Image?>(
+              valueListenable: _uiImg,
+              builder: (_, img, __) => img == null
+                  ? const Center(
+                      child: Column(mainAxisSize: MainAxisSize.min, children: [
+                        Icon(Icons.phone_android_rounded,
+                            size: 40, color: Colors.white24),
+                        SizedBox(height: 8),
+                        Text('لا يوجد بث للشاشة',
+                            style: TextStyle(color: Colors.white38)),
+                      ]),
+                    )
+                  : RawImage(image: img, fit: BoxFit.contain),
+            ),
+            Positioned.fill(
+              child: IgnorePointer(
+                child: ValueListenableBuilder<Offset?>(
+                  valueListenable: _touchPos,
+                  builder: (_, p, __) => p == null
+                      ? const SizedBox.shrink()
+                      : CustomPaint(painter: _DotPainter(p)),
+                ),
               ),
+            ),
           ]),
         );
       });
+
+  Future<void> _decodeLoop() async {
+    if (_decoding) return;
+    _decoding = true;
+    try {
+      while (_pendingFrame != null && mounted) {
+        final b = _pendingFrame!;
+        _pendingFrame = null;
+        try {
+          final codec = await ui.instantiateImageCodec(b);
+          final fr = await codec.getNextFrame();
+          codec.dispose();
+          final old = _uiImg.value;
+          _uiImg.value = fr.image;
+          if (old != null) {
+            WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+          }
+        } catch (_) {}
+      }
+    } finally {
+      _decoding = false;
+    }
+  }
+
+  void _armBar() {
+    _barTimer?.cancel();
+    _barTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted) setState(() => _barOn = false);
+    });
+  }
+
+  void _toggleBar() {
+    setState(() => _barOn = !_barOn);
+    if (_barOn) _armBar();
+  }
+
+  Widget _sbtn(IconData i, VoidCallback f) => IconButton(
+        icon: Icon(i, color: Colors.white70),
+        onPressed: () {
+          f();
+          _armBar();
+        },
+      );
+
+  /// Full-screen mirror: only a faint handle is visible; tap it to show the
+  /// transparent buttons (they hide again after 4 s).
+  Widget _screenFull() => Scaffold(
+        backgroundColor: Colors.black,
+        body: Stack(children: [
+          Positioned.fill(child: _screenArea()),
+          Positioned(
+            top: 8,
+            right: 8,
+            child: SafeArea(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _toggleBar,
+                child: Container(
+                  width: 34,
+                  height: 34,
+                  decoration: const BoxDecoration(
+                    color: Color(0x22FFFFFF),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(
+                      _barOn ? Icons.close_rounded : Icons.more_horiz_rounded,
+                      size: 18,
+                      color: Colors.white38),
+                ),
+              ),
+            ),
+          ),
+          if (_barOn)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 16,
+              child: SafeArea(
+                child: Center(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
+                    decoration: BoxDecoration(
+                      color: const Color(0x55000000),
+                      borderRadius: BorderRadius.circular(30),
+                    ),
+                    child: Row(mainAxisSize: MainAxisSize.min, children: [
+                      _sbtn(Icons.arrow_back,
+                          () => _send({'type': 'nav', 'action': 'back'})),
+                      _sbtn(Icons.home_rounded,
+                          () => _send({'type': 'nav', 'action': 'home'})),
+                      _sbtn(Icons.apps_rounded,
+                          () => _send({'type': 'nav', 'action': 'recents'})),
+                      _sbtn(Icons.notifications_rounded,
+                          () => _send({'type': 'nav', 'action': 'notifications'})),
+                      _sbtn(Icons.logout_rounded, () => Navigator.pop(context)),
+                    ]),
+                  ),
+                ),
+              ),
+            ),
+        ]),
+      );
 
   Widget _screenControls({required bool dark}) => Row(
         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
@@ -2792,6 +4622,10 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
     _clockTimer?.cancel();
     _now.dispose();
     _tc.dispose();
+    _touchPos.dispose();
+    _uiImg.value?.dispose();
+    _uiImg.dispose();
+    _barTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable();
     _pc?.close();
@@ -2851,6 +4685,28 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
               dark: dark,
               onTap: _tools),
           CtlButton(
+              icon: Icons.video_library_rounded,
+              label: 'التسجيلات',
+              dark: dark,
+              onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                      builder: (_) => LibraryPage(
+                          ip: _ipCtl.text.trim(), pin: _pinCtl.text)))),
+          CtlButton(
+              icon: Icons.security_rounded,
+              label: 'الأمان',
+              active: _cfg['on'] == true,
+              dark: dark,
+              onTap: _security),
+          CtlButton(
+              icon: _unread > 0
+                  ? Icons.notifications_active_rounded
+                  : Icons.notifications_none_rounded,
+              label: _unread > 0 ? 'الأحداث ($_unread)' : 'الأحداث',
+              dark: dark,
+              onTap: _eventsSheet),
+          CtlButton(
               icon: _wide ? Icons.fullscreen_exit : Icons.fullscreen,
               label: _wide ? 'تصغير' : 'عريض',
               dark: dark,
@@ -2884,6 +4740,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    if (widget.screen && _isConnected) return _screenFull();
     if (_wide) {
       return Scaffold(
         backgroundColor: Colors.black,
@@ -3154,13 +5011,64 @@ class _MultiViewPageState extends State<MultiViewPage> {
     super.dispose();
   }
 
-  void _save() => saveSettings({'cams': _cams});
+  void _save() {
+    saveSettings({'cams': _cams}).then((_) => refreshShortcuts());
+  }
 
   Future<void> _add() async {
     final c = await showDialog<Map<String, dynamic>>(
         context: context, builder: (_) => const _AddCamDialog());
     if (c == null || !mounted) return;
     setState(() => _cams.add(c));
+    _save();
+  }
+
+  Future<void> _menu(int i) async {
+    final v = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: kSurface,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+              leading: const Icon(Icons.edit_rounded),
+              title: const Text('تعديل الاسم واللون'),
+              onTap: () => Navigator.pop(ctx, 'edit')),
+          if (i > 0)
+            ListTile(
+                leading: const Icon(Icons.arrow_upward_rounded),
+                title: const Text('تقديم'),
+                onTap: () => Navigator.pop(ctx, 'up')),
+          if (i < _cams.length - 1)
+            ListTile(
+                leading: const Icon(Icons.arrow_downward_rounded),
+                title: const Text('تأخير'),
+                onTap: () => Navigator.pop(ctx, 'down')),
+          ListTile(
+              leading: const Icon(Icons.delete_outline_rounded),
+              title: const Text('حذف'),
+              onTap: () => Navigator.pop(ctx, 'del')),
+        ]),
+      ),
+    );
+    if (v == null || !mounted) return;
+    if (v == 'edit') {
+      final c = await showDialog<Map<String, dynamic>>(
+          context: context, builder: (_) => _AddCamDialog(initial: _cams[i]));
+      if (c == null || !mounted) return;
+      setState(() => _cams[i] = c);
+    } else if (v == 'up') {
+      setState(() {
+        final x = _cams.removeAt(i);
+        _cams.insert(i - 1, x);
+      });
+    } else if (v == 'down') {
+      setState(() {
+        final x = _cams.removeAt(i);
+        _cams.insert(i + 1, x);
+      });
+    } else if (v == 'del') {
+      setState(() => _cams.removeAt(i));
+    }
     _save();
   }
 
@@ -3252,6 +5160,7 @@ class _MultiViewPageState extends State<MultiViewPage> {
                               cam: _cams[i],
                               onOpen: () => _open(_cams[i]),
                               onRemove: () => _remove(i),
+                              onMenu: () => _menu(i),
                             ),
                   ],
                 ),
@@ -3259,8 +5168,18 @@ class _MultiViewPageState extends State<MultiViewPage> {
       );
 }
 
+const List<int> kCamColors = [
+  0xFF22D3EE,
+  0xFF34D399,
+  0xFFF472B6,
+  0xFFFBBF24,
+  0xFFA78BFA,
+  0xFFF87171,
+];
+
 class _AddCamDialog extends StatefulWidget {
-  const _AddCamDialog();
+  const _AddCamDialog({this.initial});
+  final Map<String, dynamic>? initial;
   @override
   State<_AddCamDialog> createState() => _AddCamDialogState();
 }
@@ -3271,6 +5190,19 @@ class _AddCamDialogState extends State<_AddCamDialog> {
   final _pin = TextEditingController();
   bool _scanning = false;
   List<String> _found = [];
+  int _color = kCamColors[0];
+
+  @override
+  void initState() {
+    super.initState();
+    final i = widget.initial;
+    if (i != null) {
+      _name.text = '${i['name'] ?? ''}';
+      _ip.text = '${i['ip'] ?? ''}';
+      _pin.text = '${i['pin'] ?? ''}';
+      _color = (i['color'] as int?) ?? kCamColors[0];
+    }
+  }
 
   @override
   void dispose() {
@@ -3336,6 +5268,24 @@ class _AddCamDialogState extends State<_AddCamDialog> {
               decoration: _dec('PIN'),
             ),
             const SizedBox(height: 10),
+            Wrap(spacing: 8, children: [
+              for (final c in kCamColors)
+                GestureDetector(
+                  onTap: () => setState(() => _color = c),
+                  child: Container(
+                    width: 30,
+                    height: 30,
+                    decoration: BoxDecoration(
+                      color: Color(c),
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                          color: _color == c ? Colors.white : Colors.transparent,
+                          width: 2.5),
+                    ),
+                  ),
+                ),
+            ]),
+            const SizedBox(height: 10),
             Row(children: [
               Expanded(
                 child: OutlinedButton.icon(
@@ -3380,9 +5330,10 @@ class _AddCamDialogState extends State<_AddCamDialog> {
                 'name': _name.text.trim().isEmpty ? ip : _name.text.trim(),
                 'ip': ip,
                 'pin': _pin.text.trim(),
+                'color': _color,
               });
             },
-            child: const Text('إضافة'),
+            child: Text(widget.initial == null ? 'إضافة' : 'حفظ'),
           ),
         ],
       );
@@ -3395,10 +5346,12 @@ class _CamTile extends StatefulWidget {
     required this.cam,
     required this.onOpen,
     required this.onRemove,
+    required this.onMenu,
   });
   final Map<String, dynamic> cam;
   final VoidCallback onOpen;
   final VoidCallback onRemove;
+  final VoidCallback onMenu;
   @override
   State<_CamTile> createState() => _CamTileState();
 }
@@ -3416,14 +5369,37 @@ class _CamTileState extends State<_CamTile> {
   int _n = 0;
   String _msg = 'جاري الاتصال...';
   Map _h = {};
+  Uint8List? _last; // last picture seen from this camera
+  Timer? _thumbTimer;
 
   String get _ip => '${widget.cam['ip']}';
   String get _pin => '${widget.cam['pin']}';
+  Color get _col => Color((widget.cam['color'] as int?) ?? kCamColors[0]);
 
   @override
   void initState() {
     super.initState();
+    thumbFile(_ip).then((f) async {
+      if (await f.exists()) {
+        final b = await f.readAsBytes();
+        if (mounted) setState(() => _last = b);
+      }
+    });
+    _thumbTimer = Timer.periodic(const Duration(seconds: 60), (_) => _saveLast());
     _r.initialize().then((_) => _connect());
+  }
+
+  Future<void> _saveLast() async {
+    if (!_live) return;
+    try {
+      final tr = _r.srcObject?.getVideoTracks();
+      if (tr == null || tr.isEmpty) return;
+      final png = (await tr.first.captureFrame()).asUint8List();
+      final th = await pngThumb(png, 360);
+      if (th == null) return;
+      await (await thumbFile(_ip)).writeAsBytes(th);
+      kThumbRev.value++;
+    } catch (_) {}
   }
 
   String _why(Object e) {
@@ -3481,8 +5457,7 @@ class _CamTileState extends State<_CamTile> {
       _ws = null;
       await op?.close();
       ow?.close();
-      final ws = _ws = await WebSocket.connect('ws://$_ip:$kPort')
-          .timeout(const Duration(seconds: 5));
+      final ws = _ws = await openWs(_ip).timeout(const Duration(seconds: 5));
       final pc = _pc = await createPeerConnection(kPcConfig);
       await pc.addTransceiver(
         kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
@@ -3556,6 +5531,7 @@ class _CamTileState extends State<_CamTile> {
   @override
   void dispose() {
     _alive = false;
+    _thumbTimer?.cancel();
     _retry?.cancel();
     _pc?.close();
     _ws?.close();
@@ -3568,10 +5544,23 @@ class _CamTileState extends State<_CamTile> {
     final bat = _h['bat'];
     return GestureDetector(
       onTap: widget.onOpen,
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(14),
+      onLongPress: widget.onMenu,
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(15),
+          border: Border.all(color: _col, width: 2),
+        ),
+        child: ClipRRect(
+        borderRadius: BorderRadius.circular(13),
         child: Stack(fit: StackFit.expand, children: [
           Container(color: Colors.black),
+          if (_last != null && !_live)
+            Opacity(
+              opacity: 0.45,
+              child: Image.memory(_last!,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => const SizedBox()),
+            ),
           if (_r.srcObject != null)
             RTCVideoView(_r,
                 objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover),
@@ -3603,7 +5592,7 @@ class _CamTileState extends State<_CamTile> {
                   width: 7,
                   height: 7,
                   decoration: BoxDecoration(
-                    color: _live ? kGreen : Colors.amber,
+                    color: _live ? _col : Colors.amber,
                     shape: BoxShape.circle,
                   ),
                 ),
@@ -3641,8 +5630,365 @@ class _CamTileState extends State<_CamTile> {
           ),
         ]),
       ),
+      ),
     );
   }
 }
 
-```
+// ───────────────── Recordings / events library (served by the camera) ─────────────────
+Future<File> thumbFile(String ip) async {
+  final base = await getApplicationDocumentsDirectory();
+  final d = Directory('${base.path}/thumbs');
+  if (!await d.exists()) await d.create(recursive: true);
+  return File('${d.path}/${ip.replaceAll(RegExp(r'[^0-9a-zA-Z.]'), '_')}.png');
+}
+
+/// Downscaled PNG of a captured frame (for thumbnails).
+Future<Uint8List?> pngThumb(Uint8List png, int width) async {
+  ui.Codec? codec;
+  ui.Image? img;
+  try {
+    codec = await ui.instantiateImageCodec(png, targetWidth: width);
+    img = (await codec.getNextFrame()).image;
+    final bd = await img.toByteData(format: ui.ImageByteFormat.png);
+    if (bd == null) return null;
+    return bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
+  } catch (_) {
+    return null;
+  } finally {
+    img?.dispose();
+    codec?.dispose();
+  }
+}
+
+class LibraryPage extends StatefulWidget {
+  const LibraryPage({super.key, required this.ip, required this.pin});
+  final String ip;
+  final String pin;
+  @override
+  State<LibraryPage> createState() => _LibraryPageState();
+}
+
+class _LibraryPageState extends State<LibraryPage> {
+  List<Map<String, dynamic>> _items = [];
+  bool _loading = true;
+  String? _err;
+  final Map<String, Uint8List> _thumbs = {};
+  final Map<String, double> _prog = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Uri _u(String path, [Map<String, String> q = const {}]) {
+    final qp = {'pin': widget.pin, ...q};
+    return kTls
+        ? Uri.https('${widget.ip}:$kPort', path, qp)
+        : Uri.http('${widget.ip}:$kPort', path, qp);
+  }
+
+  Future<HttpClientResponse> _get(HttpClient c, String path,
+      [Map<String, String> q = const {}]) async {
+    final req = await c.getUrl(_u(path, q));
+    return req.close();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _err = null;
+    });
+    final c = tlsClient()..connectionTimeout = const Duration(seconds: 5);
+    try {
+      final res = await _get(c, '/lib/list');
+      if (res.statusCode == 403) throw 'PIN غير صحيح';
+      if (res.statusCode == 429) throw 'محاولات كثيرة — انتظر 5 دقائق';
+      if (res.statusCode != 200) throw 'تعذّر جلب القائمة';
+      final body = await res.transform(utf8.decoder).join();
+      final l = (jsonDecode(body) as List)
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+      l.sort((a, b) => (b['t'] as num).compareTo(a['t'] as num));
+      if (!mounted) return;
+      setState(() {
+        _items = l;
+        _loading = false;
+      });
+      _loadThumbs(l);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _err = e is String ? e : 'تعذّر الاتصال بالكاميرا';
+        });
+      }
+    } finally {
+      c.close(force: true);
+    }
+  }
+
+  Future<void> _loadThumbs(List<Map<String, dynamic>> l) async {
+    final c = tlsClient()..connectionTimeout = const Duration(seconds: 5);
+    try {
+      for (final it in l) {
+        if (!mounted) return;
+        if (it['k'] != 'evt') continue;
+        final n = '${it['n']}';
+        if (_thumbs.containsKey(n)) continue;
+        try {
+          final res = await _get(c, '/lib/file', {'k': 'evt', 'n': n});
+          if (res.statusCode != 200) continue;
+          final b = BytesBuilder();
+          await for (final chunk in res) {
+            b.add(chunk);
+          }
+          if (mounted) setState(() => _thumbs[n] = b.toBytes());
+        } catch (_) {}
+      }
+    } finally {
+      c.close(force: true);
+    }
+  }
+
+  void _snack(String m) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+  }
+
+  /// Download a recording to this phone and put it in Photos.
+  Future<void> _download(Map<String, dynamic> it) async {
+    final n = '${it['n']}';
+    if (_prog.containsKey(n)) return;
+    setState(() => _prog[n] = 0);
+    final c = tlsClient()..connectionTimeout = const Duration(seconds: 5);
+    File? f;
+    try {
+      final res = await _get(c, '/lib/file', {'k': 'rec', 'n': n});
+      if (res.statusCode != 200) throw 'fail';
+      final dir = await getTemporaryDirectory();
+      f = File('${dir.path}/$n');
+      final sink = f.openWrite();
+      final total = res.contentLength > 0 ? res.contentLength : (it['s'] as num).toInt();
+      var got = 0;
+      await for (final chunk in res) {
+        sink.add(chunk);
+        got += chunk.length;
+        if (mounted && total > 0) setState(() => _prog[n] = got / total);
+      }
+      await sink.flush();
+      await sink.close();
+      if (!await Gal.hasAccess()) await Gal.requestAccess();
+      await Gal.putVideo(f.path);
+      _snack('تم تنزيل التسجيل وحفظه في الصور');
+    } catch (_) {
+      _snack('تعذّر تنزيل التسجيل');
+    } finally {
+      c.close(force: true);
+      try {
+        await f?.delete();
+      } catch (_) {}
+      if (mounted) setState(() => _prog.remove(n));
+    }
+  }
+
+  Future<void> _delete(Map<String, dynamic> it) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kSurface,
+        title: const Text('حذف من جهاز الكاميرا؟'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('إلغاء')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('حذف')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final c = tlsClient()..connectionTimeout = const Duration(seconds: 5);
+    try {
+      final res = await _get(c, '/lib/del', {'k': '${it['k']}', 'n': '${it['n']}'});
+      await res.drain();
+      if (mounted) setState(() => _items.remove(it));
+    } catch (_) {
+      _snack('تعذّر الحذف');
+    } finally {
+      c.close(force: true);
+    }
+  }
+
+  String _size(num b) => b > 1048576
+      ? '${(b / 1048576).toStringAsFixed(1)} MB'
+      : '${(b / 1024).toStringAsFixed(0)} KB';
+
+  String _evtKind(String n) => n.contains('_sound') ? 'صوت' : 'حركة';
+
+  void _openEvt(Map<String, dynamic> it) {
+    final b = _thumbs['${it['n']}'];
+    if (b == null) return;
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kSurface,
+        contentPadding: const EdgeInsets.all(10),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          Image.memory(b),
+          const SizedBox(height: 8),
+          Text(fmtStamp(DateTime.fromMillisecondsSinceEpoch((it['t'] as num).toInt())),
+              textDirection: TextDirection.ltr),
+        ]),
+        actions: [
+          TextButton(
+            onPressed: () async {
+              try {
+                if (!await Gal.hasAccess()) await Gal.requestAccess();
+                await Gal.putImageBytes(b);
+                _snack('تم الحفظ في الصور');
+              } catch (_) {
+                _snack('تعذّر الحفظ');
+              }
+            },
+            child: const Text('حفظ في الصور'),
+          ),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('إغلاق')),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = <Widget>[];
+    String? day;
+    for (final it in _items) {
+      final t = DateTime.fromMillisecondsSinceEpoch((it['t'] as num).toInt());
+      final d = '${t.year}-${two(t.month)}-${two(t.day)}';
+      if (d != day) {
+        day = d;
+        rows.add(Padding(
+          padding: const EdgeInsets.fromLTRB(4, 14, 4, 6),
+          child: Text(d,
+              textDirection: TextDirection.ltr,
+              style: const TextStyle(
+                  fontWeight: FontWeight.w800, color: Colors.white70)),
+        ));
+      }
+      final n = '${it['n']}';
+      final hm = '${two(t.hour)}:${two(t.minute)}:${two(t.second)}';
+      if (it['k'] == 'rec') {
+        final p = _prog[n];
+        rows.add(Container(
+          margin: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: kSurface,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Row(children: [
+            const Icon(Icons.videocam_rounded, color: kAccent),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('تسجيل $hm',
+                    textDirection: TextDirection.ltr,
+                    style: const TextStyle(fontWeight: FontWeight.w700)),
+                Text(_size(it['s'] as num),
+                    style: const TextStyle(fontSize: 11, color: Colors.white54)),
+                if (p != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: LinearProgressIndicator(value: p),
+                  ),
+              ]),
+            ),
+            IconButton(
+              icon: const Icon(Icons.download_rounded),
+              tooltip: 'تنزيل إلى الصور',
+              onPressed: p != null ? null : () => _download(it),
+            ),
+            IconButton(
+              icon: const Icon(Icons.delete_outline_rounded),
+              onPressed: () => _delete(it),
+            ),
+          ]),
+        ));
+      } else {
+        final b = _thumbs[n];
+        rows.add(Container(
+          margin: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: kSurface,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Row(children: [
+            GestureDetector(
+              onTap: () => _openEvt(it),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: SizedBox(
+                  width: 96,
+                  height: 60,
+                  child: b == null
+                      ? const Center(
+                          child: Icon(Icons.image_outlined, color: Colors.white24))
+                      : Image.memory(b,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, __, ___) => const Icon(
+                              Icons.hearing_rounded,
+                              color: Colors.white38)),
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('${_evtKind(n)} $hm',
+                    textDirection: TextDirection.ltr,
+                    style: const TextStyle(fontWeight: FontWeight.w700)),
+                Text('لقطة حدث',
+                    style: const TextStyle(fontSize: 11, color: Colors.white54)),
+              ]),
+            ),
+            IconButton(
+              icon: const Icon(Icons.delete_outline_rounded),
+              onPressed: () => _delete(it),
+            ),
+          ]),
+        ));
+      }
+    }
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('تسجيلات وأحداث الكاميرا'),
+        actions: [
+          IconButton(icon: const Icon(Icons.refresh_rounded), onPressed: _load),
+        ],
+      ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : _err != null
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(_err!,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Colors.white70)),
+                  ),
+                )
+              : _items.isEmpty
+                  ? const Center(
+                      child: Text('لا توجد تسجيلات أو أحداث',
+                          style: TextStyle(color: Colors.white54)))
+                  : ListView(
+                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 24),
+                      children: rows),
+    );
+  }
+}

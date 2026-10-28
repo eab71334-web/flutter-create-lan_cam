@@ -1969,6 +1969,8 @@ jobs:
           echo "::error title=Gradle error::$MSG"
           K=$(grep -hE "^e: " build*.log | sed -E 's#file:///home/runner/work/[^/]*/[^/]*/##' | head -n 25 | head -c 3500 | sed ':a;N;$!ba;s/\n/%0A/g')
           if [ -n "$K" ]; then echo "::error title=Kotlin errors::$K"; fi
+          D=$(grep -hE "\.dart:[0-9]+:[0-9]+: Error|Error when reading|Couldn't resolve|Because .* depends on|version solving failed" build*.log | head -n 25 | head -c 3500 | sed ':a;N;$!ba;s/\n/%0A/g')
+          if [ -n "$D" ]; then echo "::error title=Dart errors::$D"; fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -2944,7 +2946,15 @@ jobs:
 
       - run: flutter pub get
 
-      - run: flutter build ios --release --no-codesign
+      - name: Build iOS
+        shell: bash
+        run: flutter build ios --release --no-codesign 2>&1 | tee build.log
+
+      - name: Error summary
+        if: failure()
+        run: |
+          D=$(grep -hE "\.dart:[0-9]+:[0-9]+: Error|Error when reading|Couldn't resolve|error:|Error \(Xcode\)|\[!\]|CocoaPods could not|version solving failed|depends on" build*.log | head -n 25 | head -c 3500 | sed ':a;N;$!ba;s/\n/%0A/g')
+          echo "::error title=iOS errors::$D"
 
       - name: Package IPA
         run: |

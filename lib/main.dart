@@ -438,6 +438,756 @@ class _ThumbPreviewState extends State<ThumbPreview> {
       );
 }
 
+// ───────────────── External notifications (Telegram / ntfy) ─────────────────
+String _b64Header(String s) => '=?UTF-8?B?${base64Encode(utf8.encode(s))}?=';
+
+Future<bool> _tgSend(
+    String token, String chat, String text, Uint8List? img) async {
+  final c = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+  try {
+    if (img == null) {
+      final req = await c
+          .postUrl(Uri.parse('https://api.telegram.org/bot$token/sendMessage'));
+      req.headers.contentType = ContentType.json;
+      final body = utf8.encode(jsonEncode({'chat_id': chat, 'text': text}));
+      req.contentLength = body.length;
+      req.add(body);
+      final res = await req.close().timeout(const Duration(seconds: 15));
+      await res.drain();
+      return res.statusCode == 200;
+    }
+    final b = '----lancam${DateTime.now().microsecondsSinceEpoch}';
+    final bb = BytesBuilder();
+    void field(String n, String v) => bb.add(utf8.encode(
+        '--$b\r\nContent-Disposition: form-data; name="$n"\r\n\r\n$v\r\n'));
+    field('chat_id', chat);
+    field('caption', text);
+    bb.add(utf8.encode(
+        '--$b\r\nContent-Disposition: form-data; name="photo"; filename="snap.png"\r\nContent-Type: image/png\r\n\r\n'));
+    bb.add(img);
+    bb.add(utf8.encode('\r\n--$b--\r\n'));
+    final data = bb.takeBytes();
+    final req = await c
+        .postUrl(Uri.parse('https://api.telegram.org/bot$token/sendPhoto'));
+    req.headers.set('content-type', 'multipart/form-data; boundary=$b');
+    req.contentLength = data.length;
+    req.add(data);
+    final res = await req.close().timeout(const Duration(seconds: 25));
+    await res.drain();
+    return res.statusCode == 200;
+  } catch (_) {
+    return false;
+  } finally {
+    c.close(force: true);
+  }
+}
+
+Future<bool> _ntfySend(String server, String topic, String title, String text,
+    Uint8List? img) async {
+  final c = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+  try {
+    final base = server.trim().isEmpty
+        ? 'https://ntfy.sh'
+        : server.trim().replaceAll(RegExp(r'/+$'), '');
+    final uri = Uri.parse('$base/$topic');
+    final HttpClientRequest req =
+        img == null ? await c.postUrl(uri) : await c.putUrl(uri);
+    req.headers.set('Title', _b64Header(title));
+    req.headers.set('Priority', '4');
+    req.headers.set('Tags', 'rotating_light');
+    if (img != null) {
+      req.headers.set('Message', _b64Header(text));
+      req.headers.set('Filename', 'snap.png');
+      req.contentLength = img.length;
+      req.add(img);
+    } else {
+      final body = utf8.encode(text);
+      req.contentLength = body.length;
+      req.add(body);
+    }
+    final res = await req.close().timeout(const Duration(seconds: 25));
+    await res.drain();
+    return res.statusCode == 200;
+  } catch (_) {
+    return false;
+  } finally {
+    c.close(force: true);
+  }
+}
+
+bool pushConfigured(Map s) {
+  final tok = '${s['tgToken'] ?? ''}'.trim();
+  final chat = '${s['tgChat'] ?? ''}'.trim();
+  final topic = '${s['ntfyTopic'] ?? ''}'.trim();
+  return (tok.isNotEmpty && chat.isNotEmpty) || topic.isNotEmpty;
+}
+
+/// null = nothing configured, true = delivered, false = failed (retry later).
+Future<bool?> sendPush(String title, String text, {Uint8List? image}) async {
+  final s = await loadSettings();
+  if (!pushConfigured(s)) return null;
+  final tok = '${s['tgToken'] ?? ''}'.trim();
+  final chat = '${s['tgChat'] ?? ''}'.trim();
+  final topic = '${s['ntfyTopic'] ?? ''}'.trim();
+  var ok = true;
+  if (tok.isNotEmpty && chat.isNotEmpty) {
+    ok = await _tgSend(tok, chat, '$title\n$text', image) && ok;
+  }
+  if (topic.isNotEmpty) {
+    ok = await _ntfySend('${s['ntfyUrl'] ?? ''}', topic, title, text, image) && ok;
+  }
+  return ok;
+}
+
+class _Pending {
+  _Pending(this.title, this.text, this.image);
+  final String title;
+  final String text;
+  final Uint8List? image;
+}
+
+/// Store-and-forward: alerts that could not be delivered (no internet) are
+/// retried every 30 s while the camera app is running.
+class PushQueue {
+  static final List<_Pending> _q = [];
+  static bool _busy = false;
+
+  static Future<void> send(String title, String text, {Uint8List? image}) async {
+    final r = await sendPush(title, text, image: image);
+    if (r == false) {
+      _q.add(_Pending(title, text, image));
+      if (_q.length > 10) _q.removeAt(0);
+    }
+  }
+
+  static Future<void> flush() async {
+    if (_busy || _q.isEmpty) return;
+    _busy = true;
+    try {
+      while (_q.isNotEmpty) {
+        final p = _q.first;
+        final r = await sendPush(p.title, p.text, image: p.image);
+        if (r == false) break;
+        _q.removeAt(0);
+      }
+    } finally {
+      _busy = false;
+    }
+  }
+}
+
+/// Finds the chat id of the last message sent to the bot.
+Future<String?> tgFindChat(String token) async {
+  final c = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+  try {
+    final req = await c
+        .getUrl(Uri.parse('https://api.telegram.org/bot$token/getUpdates'));
+    final res = await req.close().timeout(const Duration(seconds: 15));
+    final body = await res.transform(utf8.decoder).join();
+    final r = (jsonDecode(body) as Map)['result'] as List;
+    for (var i = r.length - 1; i >= 0; i--) {
+      final m = r[i]['message'] ?? r[i]['channel_post'];
+      if (m != null && m['chat'] != null) return '${m['chat']['id']}';
+    }
+  } catch (_) {
+  } finally {
+    c.close(force: true);
+  }
+  return null;
+}
+
+bool wdConfigured(Map s) => '${s['wdUrl'] ?? ''}'.trim().isNotEmpty;
+
+/// Uploads a finished recording to a WebDAV server (Nextcloud, NAS...).
+Future<bool> webdavPut(File f) async {
+  final s = await loadSettings();
+  final url = '${s['wdUrl'] ?? ''}'.trim();
+  if (url.isEmpty) return true;
+  final c = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+  try {
+    final name = f.path.split('/').last;
+    final uri = Uri.parse('${url.replaceAll(RegExp(r'/+$'), '')}/$name');
+    final req = await c.putUrl(uri);
+    final u = '${s['wdUser'] ?? ''}';
+    final p = '${s['wdPass'] ?? ''}';
+    if (u.isNotEmpty) {
+      req.headers.set(
+          'Authorization', 'Basic ${base64Encode(utf8.encode('$u:$p'))}');
+    }
+    req.contentLength = await f.length();
+    await req.addStream(f.openRead());
+    final res = await req.close();
+    await res.drain();
+    return res.statusCode >= 200 && res.statusCode < 300;
+  } catch (_) {
+    return false;
+  } finally {
+    c.close(force: true);
+  }
+}
+
+// ───────────────── Daily summary ─────────────────
+class DaySummary {
+  DaySummary(this.motion, this.sound, this.hours, this.times);
+  final int motion;
+  final int sound;
+  final List<int> hours;
+  final List<String> times;
+  int get total => motion + sound;
+  int get busiest {
+    var b = 0;
+    for (var i = 1; i < 24; i++) {
+      if (hours[i] > hours[b]) b = i;
+    }
+    return b;
+  }
+
+  String text(String title) {
+    if (total == 0) return '$title: لا توجد أحداث.';
+    return '$title: $total حدث (حركة $motion، صوت $sound). '
+        'أكثر ساعة نشاطاً ${two(busiest)}:00 (${hours[busiest]} حدث).';
+  }
+}
+
+DaySummary summarizeEvents(Iterable<String> names, DateTime day) {
+  final re = RegExp(
+      r'evt_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})_(motion|sound)');
+  var m = 0;
+  var s = 0;
+  final hours = List<int>.filled(24, 0);
+  final times = <String>[];
+  for (final n in names) {
+    final x = re.firstMatch(n);
+    if (x == null) continue;
+    if (int.parse(x.group(1)!) != day.year ||
+        int.parse(x.group(2)!) != day.month ||
+        int.parse(x.group(3)!) != day.day) {
+      continue;
+    }
+    if (x.group(7) == 'sound') {
+      s++;
+    } else {
+      m++;
+    }
+    hours[int.parse(x.group(4)!)]++;
+    times.add('${x.group(4)}:${x.group(5)}');
+  }
+  times.sort();
+  return DaySummary(m, s, hours, times);
+}
+
+// ───────────────── "Why doesn't it work?" ─────────────────
+class _DiagItem {
+  _DiagItem(this.title, this.ok, this.detail, {this.fix, this.fixLabel});
+  final String title;
+  final bool? ok; // null = information only
+  final String detail;
+  final VoidCallback? fix;
+  final String? fixLabel;
+}
+
+class DiagPage extends StatefulWidget {
+  const DiagPage({super.key});
+  @override
+  State<DiagPage> createState() => _DiagPageState();
+}
+
+class _DiagPageState extends State<DiagPage> {
+  List<_DiagItem> _items = [];
+  List<_DiagItem> _conn = [];
+  final _ipCtl = TextEditingController();
+  bool _busy = true;
+
+  @override
+  void initState() {
+    super.initState();
+    loadSettings().then((s) {
+      if (mounted) _ipCtl.text = '${s['ip'] ?? ''}';
+    });
+    _run();
+  }
+
+  @override
+  void dispose() {
+    _ipCtl.dispose();
+    super.dispose();
+  }
+
+  Future<bool> _internet() async {
+    try {
+      final s = await Socket.connect('1.1.1.1', 443,
+          timeout: const Duration(seconds: 3));
+      s.destroy();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _run() async {
+    setState(() => _busy = true);
+    final out = <_DiagItem>[];
+    final ip = await localIp();
+    out.add(_DiagItem('الشبكة المحلية (واي فاي)', ip != null,
+        ip ?? 'غير متصل بشبكة. اتصل بالواي فاي نفسه على الهاتفين.'));
+    final cam = await Permission.camera.status;
+    out.add(_DiagItem('إذن الكاميرا', cam.isGranted,
+        cam.isGranted ? 'مسموح' : 'غير مسموح (مطلوب لجهاز الكاميرا)',
+        fixLabel: 'السماح', fix: () async {
+      final r = await Permission.camera.request();
+      if (!r.isGranted) await openAppSettings();
+      _run();
+    }));
+    final mic = await Permission.microphone.status;
+    out.add(_DiagItem('إذن الميكروفون', mic.isGranted,
+        mic.isGranted ? 'مسموح' : 'غير مسموح (الصوت لن يعمل)',
+        fixLabel: 'السماح', fix: () async {
+      final r = await Permission.microphone.request();
+      if (!r.isGranted) await openAppSettings();
+      _run();
+    }));
+    if (Platform.isAndroid) {
+      try {
+        final m = await _svc.invokeMethod<Map>('status');
+        final sc = await _svc.invokeMethod<Map>('screenInfo');
+        out.add(_DiagItem(
+            'الخدمة في الخلفية',
+            m?['running'] == true,
+            m?['running'] == true
+                ? 'تعمل'
+                : 'متوقفة. فعّل "جاهزية دائمة" في وضع الكاميرا.'));
+        out.add(_DiagItem('منفذ الإيقاظ $kWakePort', m?['listening'] == true,
+            m?['listening'] == true ? 'يستمع' : 'لا يستمع (الجاهزية الدائمة مطفأة)'));
+        out.add(_DiagItem(
+            'استثناء توفير البطارية',
+            m?['battery'] == true,
+            m?['battery'] == true
+                ? 'مستثنى'
+                : 'النظام قد يقتل التطبيق في الخلفية',
+            fixLabel: 'استثناء',
+            fix: () async {
+              try {
+                await _svc.invokeMethod('battery');
+              } catch (_) {}
+              Future.delayed(const Duration(seconds: 2), _run);
+            }));
+        out.add(_DiagItem(
+            'الظهور فوق التطبيقات',
+            m?['overlay'] == true,
+            m?['overlay'] == true
+                ? 'مسموح'
+                : 'مطلوب لإيقاظ الكاميرا وهي مغلقة',
+            fixLabel: 'السماح',
+            fix: () async {
+              try {
+                await _svc.invokeMethod('overlay');
+              } catch (_) {}
+              Future.delayed(const Duration(seconds: 2), _run);
+            }));
+        out.add(_DiagItem(
+            'التحكم في الشاشة (إمكانية الوصول)',
+            sc?['control'] == true,
+            sc?['control'] == true
+                ? 'مفعّل'
+                : 'اختياري: يلزم لتحكم المشاهد بالشاشة. افتح الإعدادات ← التطبيقات ← LAN Cam ← ⋮ ← السماح بالإعدادات المقيّدة أولاً.',
+            fixLabel: 'فتح',
+            fix: () async {
+              try {
+                await _svc.invokeMethod('openAccessibility');
+              } catch (_) {}
+            }));
+      } catch (_) {}
+    }
+    out.add(_DiagItem('تشفير TLS', kTls,
+        kTls ? 'مفعّل' : 'غير مضمّن في هذا الإصدار (الاتصال غير مشفّر)'));
+    final s = await loadSettings();
+    final net = await _internet();
+    if (pushConfigured(s)) {
+      out.add(_DiagItem('إشعارات خارجية (تيليغرام / ntfy)', net,
+          net ? 'مُعدّة والإنترنت متاح' : 'مُعدّة لكن لا يوجد إنترنت الآن'));
+    } else {
+      out.add(_DiagItem('إشعارات خارجية (تيليغرام / ntfy)', null,
+          'غير مُعدّة (الإعدادات ← إشعارات خارجية)'));
+    }
+    if (!mounted) return;
+    setState(() {
+      _items = out;
+      _busy = false;
+    });
+  }
+
+  Future<void> _test() async {
+    final ip = _ipCtl.text.trim();
+    if (ip.isEmpty) return;
+    setState(() => _conn = []);
+    final main = await portOpen(ip, kPort);
+    final wake = await portOpen(ip, kWakePort);
+    final out = <_DiagItem>[
+      _DiagItem(
+          'منفذ الكاميرا $kPort',
+          main,
+          main
+              ? 'الكاميرا تعمل وتستقبل'
+              : 'لا يوجد رد: الكاميرا مغلقة أو العنوان خطأ أو شبكة مختلفة'),
+      _DiagItem(
+          'منفذ الإيقاظ $kWakePort',
+          wake,
+          wake
+              ? 'الجاهزية الدائمة تعمل (يمكن إيقاظها)'
+              : main
+                  ? 'غير مفعّل (غير مطلوب والكاميرا شغّالة)'
+                  : 'الجاهزية الدائمة غير مفعّلة على الكاميرا'),
+    ];
+    if (!mounted) return;
+    setState(() => _conn = out);
+  }
+
+  Widget _row(_DiagItem it) => Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: kSurface,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Icon(
+              it.ok == null
+                  ? Icons.info_outline_rounded
+                  : (it.ok! ? Icons.check_circle_rounded : Icons.cancel_rounded),
+              color: it.ok == null
+                  ? Colors.white38
+                  : (it.ok! ? kGreen : kRed),
+              size: 22),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(it.title, style: const TextStyle(fontWeight: FontWeight.w700)),
+              const SizedBox(height: 2),
+              Text(it.detail,
+                  style: const TextStyle(fontSize: 12, color: Colors.white60)),
+            ]),
+          ),
+          if (it.ok != true && it.fix != null)
+            TextButton(onPressed: it.fix, child: Text(it.fixLabel ?? 'إصلاح')),
+        ]),
+      );
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(
+          title: const Text('لماذا لا يعمل؟'),
+          actions: [
+            IconButton(icon: const Icon(Icons.refresh_rounded), onPressed: _run),
+          ],
+        ),
+        body: ListView(padding: const EdgeInsets.all(14), children: [
+          const Text('هذا الهاتف',
+              style: TextStyle(fontWeight: FontWeight.w800, color: Colors.white70)),
+          const SizedBox(height: 8),
+          if (_busy) const Center(child: CircularProgressIndicator()),
+          for (final it in _items) _row(it),
+          const SizedBox(height: 16),
+          const Text('اختبار الاتصال بكاميرا',
+              style: TextStyle(fontWeight: FontWeight.w800, color: Colors.white70)),
+          const SizedBox(height: 8),
+          Row(children: [
+            Expanded(
+              child: TextField(
+                controller: _ipCtl,
+                keyboardType: TextInputType.url,
+                textDirection: TextDirection.ltr,
+                decoration: InputDecoration(
+                  hintText: 'IP الكاميرا',
+                  filled: true,
+                  fillColor: kSurface,
+                  border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide.none),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            FilledButton(onPressed: _test, child: const Text('فحص')),
+          ]),
+          const SizedBox(height: 10),
+          for (final it in _conn) _row(it),
+        ]),
+      );
+}
+
+// ───────────────── First-run setup wizard ─────────────────
+class SetupWizard extends StatefulWidget {
+  const SetupWizard({super.key});
+  @override
+  State<SetupWizard> createState() => _SetupWizardState();
+}
+
+class _SetupWizardState extends State<SetupWizard> {
+  int _step = 0;
+  String _role = ''; // camera | viewer
+  String _ip = '';
+  String _pin = '';
+  Map _st = {};
+
+  Future<void> _refresh() async {
+    if (!Platform.isAndroid) return;
+    try {
+      final m = await _svc.invokeMethod<Map>('status');
+      if (mounted) setState(() => _st = m ?? {});
+    } catch (_) {}
+  }
+
+  List<String> get _steps => _role == 'camera'
+      ? ['role', 'perm', if (Platform.isAndroid) 'bg', 'alerts', 'pair']
+      : ['role', 'pair'];
+
+  Future<void> _finish() async {
+    await saveSettings({'setupDone': true});
+    if (mounted) Navigator.pop(context);
+  }
+
+  void _next() {
+    if (_step + 1 >= _steps.length) {
+      _finish();
+    } else {
+      setState(() => _step++);
+      if (_steps[_step] == 'pair' && _role == 'camera') _prepPair();
+      if (_steps[_step] == 'bg') _refresh();
+    }
+  }
+
+  Future<void> _prepPair() async {
+    final s = await loadSettings();
+    var pin = (s['campin'] as String?) ?? '';
+    if (pin.isEmpty) {
+      pin = _newPin();
+      await saveSettings({'campin': pin});
+    }
+    final ip = await localIp() ?? '';
+    if (mounted) {
+      setState(() {
+        _pin = pin;
+        _ip = ip;
+      });
+    }
+  }
+
+  Future<void> _scan() async {
+    final v = await Navigator.push<String>(
+        context, MaterialPageRoute(builder: (_) => const QrScanPage()));
+    if (v == null || !mounted) return;
+    final p = v.split('|');
+    if (p.length < 4) return;
+    await saveSettings({'setupDone': true});
+    if (!mounted) return;
+    Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+            builder: (_) => ViewerPage(
+                initialIp: p[1], initialPin: p[3], autoConnect: true)));
+  }
+
+  Widget _ok(bool v, String t, VoidCallback? fix, String label) => ListTile(
+        contentPadding: EdgeInsets.zero,
+        leading: Icon(v ? Icons.check_circle_rounded : Icons.radio_button_unchecked,
+            color: v ? kGreen : Colors.white38),
+        title: Text(t),
+        trailing: v
+            ? null
+            : FilledButton.tonal(onPressed: fix, child: Text(label)),
+      );
+
+  Widget _page() {
+    switch (_steps[_step]) {
+      case 'role':
+        return Column(children: [
+          const Text('ما دور هذا الهاتف؟',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 18),
+          ModeCard(
+            icon: Icons.videocam_rounded,
+            title: 'كاميرا',
+            subtitle: 'يبقى في مكانه ويبث',
+            color: kAccent,
+            tint: const Color(0x2622D3EE),
+            onTap: () {
+              setState(() => _role = 'camera');
+              _next();
+            },
+          ),
+          const SizedBox(height: 12),
+          ModeCard(
+            icon: Icons.visibility_rounded,
+            title: 'مشاهد',
+            subtitle: 'أشاهد به الكاميرا وأتحكم',
+            color: const Color(0xFFA78BFA),
+            tint: const Color(0x26A78BFA),
+            onTap: () {
+              setState(() => _role = 'viewer');
+              _next();
+            },
+          ),
+        ]);
+      case 'perm':
+        return FutureBuilder<List<PermissionStatus>>(
+          future: Future.wait([Permission.camera.status, Permission.microphone.status]),
+          builder: (ctx, snap) {
+            final cam = snap.data?[0].isGranted ?? false;
+            final mic = snap.data?[1].isGranted ?? false;
+            return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('الأذونات',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+              const SizedBox(height: 12),
+              _ok(cam, 'الكاميرا', () async {
+                await Permission.camera.request();
+                setState(() {});
+              }, 'السماح'),
+              _ok(mic, 'الميكروفون', () async {
+                await Permission.microphone.request();
+                setState(() {});
+              }, 'السماح'),
+            ]);
+          },
+        );
+      case 'bg':
+        return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('العمل في الخلفية',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 4),
+          const Text('كي تبقى الكاميرا تعمل وتُوقَظ وهي مغلقة',
+              style: TextStyle(color: Colors.white54, fontSize: 12)),
+          const SizedBox(height: 10),
+          _ok(_st['battery'] == true, 'استثناء توفير البطارية', () async {
+            try {
+              await _svc.invokeMethod('battery');
+            } catch (_) {}
+            Future.delayed(const Duration(seconds: 2), _refresh);
+          }, 'استثناء'),
+          _ok(_st['overlay'] == true, 'الظهور فوق التطبيقات', () async {
+            try {
+              await _svc.invokeMethod('overlay');
+            } catch (_) {}
+            Future.delayed(const Duration(seconds: 2), _refresh);
+          }, 'السماح'),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.touch_app_rounded, color: Colors.white54),
+            title: const Text('التحكم في الشاشة (اختياري)'),
+            subtitle: const Text(
+                'أولاً: الإعدادات ← التطبيقات ← LAN Cam ← ⋮ ← السماح بالإعدادات المقيّدة',
+                style: TextStyle(fontSize: 11, color: Colors.white54)),
+            trailing: FilledButton.tonal(
+                onPressed: () async {
+                  try {
+                    await _svc.invokeMethod('openAccessibility');
+                  } catch (_) {}
+                },
+                child: const Text('فتح')),
+          ),
+        ]);
+      case 'alerts':
+        return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('إشعارات وأنت بعيد (اختياري)',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 8),
+          const Text(
+              'تصلك لقطة وتنبيه على هاتفك عبر تيليغرام أو ntfy حتى والتطبيق مغلق. يلزم إنترنت على هاتف الكاميرا فقط.',
+              style: TextStyle(color: Colors.white60, height: 1.6)),
+          const SizedBox(height: 14),
+          FilledButton.tonalIcon(
+            icon: const Icon(Icons.notifications_active_rounded),
+            label: const Text('إعداد الإشعارات'),
+            onPressed: () => Navigator.push(context,
+                MaterialPageRoute(builder: (_) => const SettingsPage())),
+          ),
+        ]);
+      default: // pair
+        if (_role == 'camera') {
+          return Column(children: [
+            const Text('اربط جهاز المشاهدة',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 12),
+            if (_ip.isEmpty || _pin.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(20),
+                child: Text('تأكد أنك متصل بالواي فاي'),
+              )
+            else ...[
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: QrImageView(
+                    data: 'LANCAM|$_ip|$kPort|$_pin',
+                    version: QrVersions.auto,
+                    size: 220,
+                    backgroundColor: Colors.white),
+              ),
+              const SizedBox(height: 10),
+              Text('$_ip  •  PIN $_pin',
+                  textDirection: TextDirection.ltr,
+                  style: const TextStyle(color: Colors.white60)),
+              const SizedBox(height: 8),
+              const Text('على هاتف المشاهد: اختر "مشاهد" ثم امسح هذا الرمز.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.white54, fontSize: 12)),
+            ],
+          ]);
+        }
+        return Column(children: [
+          const Text('اربط الكاميرا',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 10),
+          const Text('على هاتف الكاميرا افتح "وضع الكاميرا" ثم "عرض رمز QR للربط"، وامسحه هنا.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white60, height: 1.6)),
+          const SizedBox(height: 18),
+          FilledButton.icon(
+            icon: const Icon(Icons.qr_code_scanner_rounded),
+            label: const Text('مسح الرمز'),
+            onPressed: _scan,
+          ),
+        ]);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(
+          title: const Text('الإعداد السريع'),
+          actions: [
+            TextButton(onPressed: _finish, child: const Text('تخطي')),
+          ],
+        ),
+        body: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(18),
+            child: Column(children: [
+              if (_role.isNotEmpty)
+                LinearProgressIndicator(value: (_step + 1) / _steps.length),
+              const SizedBox(height: 18),
+              Expanded(child: SingleChildScrollView(child: _page())),
+              if (_steps[_step] != 'role')
+                Row(children: [
+                  if (_step > 0)
+                    TextButton(
+                        onPressed: () => setState(() => _step--),
+                        child: const Text('السابق')),
+                  const Spacer(),
+                  FilledButton(
+                    onPressed: _next,
+                    child: Text(_step + 1 >= _steps.length ? 'تم' : 'التالي'),
+                  ),
+                ]),
+            ]),
+          ),
+        ),
+      );
+}
+
+
 class _DotPainter extends CustomPainter {
   _DotPainter(this.p);
   final Offset p;
@@ -963,6 +1713,20 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _checkAutostart();
     initShortcuts();
+    _firstRun();
+  }
+
+  Future<void> _firstRun() async {
+    final st = await loadSettings();
+    if (st['setupDone'] == true || !mounted) return;
+    if (st['campin'] != null || st['ip'] != null) {
+      saveSettings({'setupDone': true}); // existing user: no wizard
+      return;
+    }
+    await Future.delayed(const Duration(milliseconds: 700));
+    if (!mounted || CameraPage.active) return;
+    Navigator.push(
+        context, MaterialPageRoute(builder: (_) => const SetupWizard()));
   }
 
   @override
@@ -1080,7 +1844,22 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
                       onTap: () => Navigator.push(context,
                           MaterialPageRoute(builder: (_) => const SettingsPage())),
                     ),
-                    const SizedBox(height: 28),
+                    const SizedBox(height: 12),
+                    Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                      TextButton.icon(
+                        icon: const Icon(Icons.health_and_safety_rounded, size: 18),
+                        label: const Text('لماذا لا يعمل؟'),
+                        onPressed: () => Navigator.push(context,
+                            MaterialPageRoute(builder: (_) => const DiagPage())),
+                      ),
+                      TextButton.icon(
+                        icon: const Icon(Icons.rocket_launch_rounded, size: 18),
+                        label: const Text('الإعداد السريع'),
+                        onPressed: () => Navigator.push(context,
+                            MaterialPageRoute(builder: (_) => const SetupWizard())),
+                      ),
+                    ]),
+                    const SizedBox(height: 16),
                     Wrap(
                       alignment: WrapAlignment.center,
                       spacing: 8,
@@ -1138,6 +1917,36 @@ class _SettingsPageState extends State<SettingsPage> {
   void _set(String k, Object v) {
     setState(() => _s[k] = v);
     saveSettings({k: v});
+  }
+
+  Widget _field(String label, String key,
+          {bool obscure = false, String hint = ''}) =>
+      Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: TextFormField(
+          key: ValueKey('f_${key}_${_s[key] ?? ''}'),
+          initialValue: '${_s[key] ?? ''}',
+          obscureText: obscure,
+          textDirection: TextDirection.ltr,
+          onChanged: (v) {
+            _s[key] = v.trim();
+            saveSettings({key: v.trim()});
+          },
+          decoration: InputDecoration(
+            labelText: label,
+            hintText: hint,
+            filled: true,
+            fillColor: kBg,
+            border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: BorderSide.none),
+          ),
+        ),
+      );
+
+  void _toast(String m) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
   }
 
   Widget _chips<T>(String label, String key, T def, List<T> values,
@@ -1228,6 +2037,79 @@ class _SettingsPageState extends State<SettingsPage> {
                 '• للمشاهدة من خارج البيت: ثبّت Tailscale (مجاني) على الهاتفين واكتب عنوان 100.x الظاهر في الكاميرا. لا تفتح المنافذ 8080/8081 في الراوتر.',
                 style: TextStyle(fontSize: 12, color: Colors.white70, height: 1.6),
               ),
+            ),
+          ]),
+          _group('إشعارات خارجية (والتطبيق مغلق)', Icons.send_rounded, [
+            const Padding(
+              padding: EdgeInsets.only(bottom: 12),
+              child: Text(
+                  'تُعدّ على هاتف الكاميرا. تيليغرام: أنشئ بوتاً من @BotFather وضع الرمز، ثم أرسل أي رسالة للبوت واضغط "جلب Chat ID". ntfy: ثبّت تطبيق ntfy على هاتفك واشترك بنفس اسم الموضوع. يلزم إنترنت على هاتف الكاميرا.',
+                  style: TextStyle(fontSize: 12, color: Colors.white60, height: 1.6)),
+            ),
+            _field('Telegram Bot Token', 'tgToken', obscure: true),
+            _field('Telegram Chat ID', 'tgChat'),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Wrap(spacing: 8, children: [
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.search_rounded, size: 18),
+                  label: const Text('جلب Chat ID'),
+                  onPressed: () async {
+                    final id = await tgFindChat('${_s['tgToken'] ?? ''}'.trim());
+                    if (id == null) {
+                      _toast('لم أجد رسالة: أرسل رسالة للبوت أولاً وتأكد من الرمز');
+                    } else {
+                      setState(() => _s['tgChat'] = id);
+                      saveSettings({'tgChat': id});
+                      _toast('تم جلب Chat ID');
+                    }
+                  },
+                ),
+                FilledButton.tonalIcon(
+                  icon: const Icon(Icons.outbox_rounded, size: 18),
+                  label: const Text('إرسال اختبار'),
+                  onPressed: () async {
+                    final r = await sendPush('LAN Cam', 'رسالة تجريبية');
+                    _toast(r == null
+                        ? 'لم تُضبط أي قناة بعد'
+                        : (r ? 'وصلت الرسالة' : 'فشل الإرسال: تحقق من البيانات والإنترنت'));
+                  },
+                ),
+              ]),
+            ),
+            _field('ntfy topic', 'ntfyTopic', hint: 'مثال: lancam-ahmed-8f3k'),
+            _field('خادم ntfy (اختياري)', 'ntfyUrl', hint: 'https://ntfy.sh'),
+            _chips<int>('ملخص يومي بإشعار', 'dailyHour', -1,
+                [-1, 20, 21, 22, 23], ['إيقاف', '8 م', '9 م', '10 م', '11 م']),
+          ]),
+          _group('نسخ احتياطي', Icons.cloud_upload_rounded, [
+            const Padding(
+              padding: EdgeInsets.only(bottom: 12),
+              child: Text(
+                  'WebDAV (Nextcloud أو NAS): كل تسجيل ينتهي يُرفع تلقائياً من هاتف الكاميرا. النسخ إلى الصور على الـ iPhone يتم عند الاتصال بالكاميرا.',
+                  style: TextStyle(fontSize: 12, color: Colors.white60, height: 1.6)),
+            ),
+            _field('رابط WebDAV (جهاز الكاميرا)', 'wdUrl',
+                hint: 'https://server/remote.php/dav/files/user/LANCam'),
+            _field('اسم المستخدم', 'wdUser'),
+            _field('كلمة المرور', 'wdPass', obscure: true),
+            _chips<bool>('نسخ التسجيلات إلى الصور تلقائياً (جهاز المشاهدة)',
+                'autoBackup', false, [false, true], ['إيقاف', 'تشغيل']),
+          ]),
+          _group('مساعدة', Icons.help_outline_rounded, [
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.rocket_launch_rounded),
+              title: const Text('الإعداد السريع'),
+              onTap: () => Navigator.push(context,
+                  MaterialPageRoute(builder: (_) => const SetupWizard())),
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.health_and_safety_rounded),
+              title: const Text('لماذا لا يعمل؟'),
+              onTap: () => Navigator.push(context,
+                  MaterialPageRoute(builder: (_) => const DiagPage())),
             ),
           ]),
           _group('التنبيهات (جهاز المشاهدة)', Icons.notifications_active_rounded, [
@@ -1451,6 +2333,21 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   int _lockMin = 5;
   int _alertGap = 20;
   bool get _recShown => _recording && !_rolling;
+  bool _dropping = false;
+  // view-only PIN, charge start, notifications, time-lapse
+  String _viewPin = '';
+  bool _chargeStart = false;
+  bool _lastChg = false;
+  bool _lowSent = false;
+  int _lastTickMs = DateTime.now().millisecondsSinceEpoch;
+  int _tl = 0;
+  DateTime _lastTl = DateTime.fromMillisecondsSinceEpoch(0);
+  Timer? _tlTimer;
+  Timer? _pushTimer;
+  int _lastSummaryDay = 0;
+  int _dailyHour = -1;
+  int _aliveSave = 0;
+  final Set<String> _wdPending = {};
 
   @override
   void initState() {
@@ -1489,10 +2386,27 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     _lockTries = (s['lockTries'] as int?) ?? 5;
     _lockMin = (s['lockMin'] as int?) ?? 5;
     _alertGap = (s['alertGap'] as int?) ?? 20;
+    _chargeStart = s['chargeStart'] == true;
+    _tl = (s['m_tl'] as int?) ?? 0;
+    _dailyHour = (s['dailyHour'] as int?) ?? -1;
+    _viewPin = (s['viewpin'] as String?) ?? '';
+    if (_viewPin.isEmpty || _viewPin == _pin) {
+      _viewPin = _newPin();
+      saveSettings({'viewpin': _viewPin});
+    }
+    final aliveTs = (s['aliveTs'] as int?) ?? 0;
+    if (aliveTs > 0) {
+      final gap = DateTime.now().millisecondsSinceEpoch - aliveTs;
+      if (gap > 180000 && gap < 43200000) {
+        PushQueue.send('LAN Cam',
+            'عادت الكاميرا للعمل بعد ${gap ~/ 60000} دقيقة من التوقف');
+      }
+    }
     await applyNetConfig();
     if (Platform.isAndroid) {
       try {
-        await _svc.invokeMethod('config', {'always': _always, 'pin': _pin});
+        await _svc.invokeMethod(
+            'config', {'always': _always, 'pin': _pin, 'charge': _chargeStart});
       } catch (_) {}
     }
 
@@ -1562,6 +2476,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       final remote = req.connectionInfo?.remoteAddress.address ?? '?';
       final ws = await WebSocketTransformer.upgrade(req);
       var authed = false;
+      var role = 'admin';
       ws.listen((m) async {
         if (m is! String) return;
         final d = jsonDecode(m);
@@ -1572,7 +2487,8 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
               await ws.close();
               return;
             }
-            if ((d['pin'] ?? '') != _pin) {
+            final rl = _roleFor('${d['pin'] ?? ''}');
+            if (rl == null) {
               _fails.putIfAbsent(remote, () => []).add(DateTime.now());
               ws.add(jsonEncode({'type': 'denied'}));
               await ws.close();
@@ -1580,16 +2496,18 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
             }
             _fails.remove(remote);
             authed = true;
+            role = rl;
             _ws = ws;
+            ws.add(jsonEncode({'type': 'role', 'role': rl}));
             await _answer(ws, d['sdp'] as String);
             _sendRec();
             _sendCfg();
             break;
           case 'record':
-            if (authed) await _setRec(d['on'] == true);
+            if (authed && role == 'admin') await _setRec(d['on'] == true);
             break;
           case 'cmd':
-            if (authed) await _cmd(d);
+            if (authed && role == 'admin') await _cmd(d);
             break;
           case 'screen':
             if (_locked(remote)) {
@@ -1597,7 +2515,8 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
               await ws.close();
               return;
             }
-            if ((d['pin'] ?? '') != _pin) {
+            final rl = _roleFor('${d['pin'] ?? ''}');
+            if (rl == null) {
               _fails.putIfAbsent(remote, () => []).add(DateTime.now());
               ws.add(jsonEncode({'type': 'denied'}));
               await ws.close();
@@ -1605,13 +2524,15 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
             }
             _fails.remove(remote);
             authed = true;
+            role = rl;
+            ws.add(jsonEncode({'type': 'role', 'role': rl}));
             await _attachScreen(ws);
             break;
           case 'tap':
           case 'swipe':
           case 'nav':
           case 'touch':
-            if (authed) await _remoteInput(d);
+            if (authed && role == 'admin') await _remoteInput(d);
             break;
         }
       }, onDone: () => _detachScreen(ws));
@@ -1626,7 +2547,22 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       _now.value = DateTime.now();
       _idleTick();
+      final ms = DateTime.now().millisecondsSinceEpoch;
+      if (ms - _lastTickMs > 180000) {
+        PushQueue.send('LAN Cam',
+            'الكاميرا كانت متوقفة ${(ms - _lastTickMs) ~/ 60000} دقيقة وعادت الآن');
+      }
+      _lastTickMs = ms;
+      _dailyCheck();
     });
+    _pushTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      PushQueue.flush();
+      _wdFlush();
+      if (++_aliveSave % 2 == 0) {
+        saveSettings({'aliveTs': DateTime.now().millisecondsSinceEpoch});
+      }
+    });
+    _tlTimer = Timer.periodic(const Duration(seconds: 20), (_) => _tlTick());
     _soundTimer =
         Timer.periodic(const Duration(milliseconds: 500), (_) => _soundTick());
     _preTimer = Timer.periodic(const Duration(seconds: 1), (_) => _preTick());
@@ -1701,6 +2637,10 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     } catch (_) {}
   }
 
+  String? _roleFor(String p) => p == _pin
+      ? 'admin'
+      : ((_viewPin.isNotEmpty && p == _viewPin) ? 'view' : null);
+
   bool _locked(String ip) {
     final l = _fails[ip];
     if (l == null) return false;
@@ -1760,6 +2700,19 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       m['bat'] = await _battery.batteryLevel;
       final st = await _battery.batteryState;
       m['chg'] = st == BatteryState.charging || st == BatteryState.full;
+      final bat = m['bat'];
+      final chg = m['chg'] == true;
+      if (bat is int) {
+        if (chg) _lowSent = false;
+        if (!chg && bat <= 15 && !_lowSent) {
+          _lowSent = true;
+          PushQueue.send('بطارية الكاميرا منخفضة', '$bat% — وصّلها بالشاحن');
+        }
+        if (_lastChg && !chg) {
+          PushQueue.send('فُصل الشاحن', 'بطارية الكاميرا $bat%');
+        }
+        _lastChg = chg;
+      }
     } catch (_) {}
     if (Platform.isAndroid) {
       try {
@@ -1796,6 +2749,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         'sh': _sSh,
         'eh': _sEh,
         'pre': _pre,
+        'tl': _tl,
         'person': _mPerson,
         'personAvail': kPersonSupported,
       }));
@@ -1824,6 +2778,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     }
     if (d['sched'] is bool) _sched = d['sched'] as bool;
     if (d['pre'] is bool) _pre = d['pre'] as bool;
+    if (d['tl'] is num) _tl = (d['tl'] as num).toInt().clamp(0, 60).toInt();
     if (d['person'] is bool) _mPerson = d['person'] as bool;
     if (d['sh'] is num) _sSh = (d['sh'] as num).toInt().clamp(0, 23).toInt();
     if (d['eh'] is num) _sEh = (d['eh'] as num).toInt().clamp(0, 23).toInt();
@@ -1835,6 +2790,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     _streak = 0;
     saveSettings({
       'm_pre': _pre,
+      'm_tl': _tl,
       'm_person': _mPerson,
       'm_son': _sOn,
       'm_sched': _sched,
@@ -1877,11 +2833,11 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     }
   }
 
-  Future<Uint8List?> _thumb(Uint8List png) async {
+  Future<Uint8List?> _thumb(Uint8List png, [int w = 480]) async {
     ui.Codec? codec;
     ui.Image? img;
     try {
-      codec = await ui.instantiateImageCodec(png, targetWidth: 480);
+      codec = await ui.instantiateImageCodec(png, targetWidth: w);
       img = (await codec.getNextFrame()).image;
       final bd = await img.toByteData(format: ui.ImageByteFormat.png);
       if (bd == null) return null;
@@ -2074,6 +3030,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       for (final f in files) {
         if (total <= limit * 0.9) break;
         if (_recording && (f.path == cur || f.path == curSrt)) continue;
+        if (_wdPending.contains(f.path)) continue;
         total -= stats[f.path]!.size;
         try {
           await f.delete();
@@ -2145,7 +3102,9 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   Future<void> _dropRolling() async {
     final p = _recPath;
     _rolling = false;
+    _dropping = true;
     await _toggleRec(); // stops
+    _dropping = false;
     if (p != null) {
       try {
         await File(p).delete();
@@ -2170,6 +3129,10 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         if (th != null) 'img': base64Encode(th),
       }));
     } catch (_) {}
+    PushQueue.send(
+        kind == 'sound' ? 'صوت عالٍ عند الكاميرا' : 'حركة مكتشفة',
+        fmtStamp(t),
+        image: th);
     Future.delayed(const Duration(seconds: 3), () async {
       try {
         final tr = _stream?.getVideoTracks();
@@ -2350,16 +3313,46 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         return;
       }
       final q = req.uri.queryParameters;
-      if (q['pin'] != _pin) {
+      final role = _roleFor('${q['pin'] ?? ''}');
+      if (role == null) {
         _fails.putIfAbsent(remote, () => []).add(DateTime.now());
         res.statusCode = 403;
         await res.close();
         return;
       }
       _fails.remove(remote);
+      res.headers.set('x-role', role);
       final recDir = await _recDirectory();
-      final evtDir =
-          Directory('${(await getApplicationDocumentsDirectory()).path}/events');
+      final docsPath = (await getApplicationDocumentsDirectory()).path;
+      final evtDir = Directory('$docsPath/events');
+      final tlDir = Directory('$docsPath/timelapse');
+      if (path == '/lib/tl') {
+        final names = <String>[];
+        if (await tlDir.exists()) {
+          await for (final e in tlDir.list()) {
+            if (e is File && e.path.endsWith('.png')) {
+              names.add(e.path.split('/').last);
+            }
+          }
+        }
+        names.sort();
+        final day = q['d'];
+        res.headers.contentType = ContentType.json;
+        if (day == null) {
+          final cnt = <String, int>{};
+          for (final n in names) {
+            final m = RegExp(r'tl_(\d{4}-\d{2}-\d{2})_').firstMatch(n);
+            if (m != null) cnt[m.group(1)!] = (cnt[m.group(1)!] ?? 0) + 1;
+          }
+          res.write(jsonEncode([
+            for (final e in cnt.entries) {'d': e.key, 'n': e.value}
+          ]));
+        } else {
+          res.write(jsonEncode(names.where((n) => n.startsWith('tl_$day')).toList()));
+        }
+        await res.close();
+        return;
+      }
       if (path == '/lib/list') {
         final items = <Map<String, dynamic>>[];
         if (await recDir.exists()) {
@@ -2402,7 +3395,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         await res.close();
         return;
       }
-      final dir = kind == 'evt' ? evtDir : recDir;
+      final dir = kind == 'evt' ? evtDir : (kind == 'tl' ? tlDir : recDir);
       final f = File('${dir.path}/$name');
       if (path == '/lib/file') {
         if (!await f.exists()) {
@@ -2417,8 +3410,25 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         return;
       }
       if (path == '/lib/del') {
+        if (role != 'admin') {
+          res.statusCode = 403;
+          await res.close();
+          return;
+        }
         try {
-          if (await f.exists()) await f.delete();
+          if (kind == 'tl') {
+            if (await tlDir.exists()) {
+              await for (final e in tlDir.list()) {
+                if (e is File && e.path.split('/').last.startsWith('tl_$name')) {
+                  try {
+                    await e.delete();
+                  } catch (_) {}
+                }
+              }
+            }
+          } else if (await f.exists()) {
+            await f.delete();
+          }
           if (kind == 'rec') {
             final srt = File(f.path.replaceFirst(RegExp(r'\.mp4$'), '.srt'));
             if (await srt.exists()) await srt.delete();
@@ -2441,10 +3451,108 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     }
   }
 
+  // ───────────── WebDAV / daily summary / time-lapse ─────────────
+  Future<void> _wdUpload(String? p) async {
+    if (p == null) return;
+    final s = await loadSettings();
+    if (!wdConfigured(s)) return;
+    _wdPending.add(p);
+    await _wdFlush();
+  }
+
+  Future<void> _wdFlush() async {
+    for (final p in _wdPending.toList()) {
+      final f = File(p);
+      if (!await f.exists()) {
+        _wdPending.remove(p);
+        continue;
+      }
+      final ok = await webdavPut(f);
+      if (!ok) break;
+      final srt = File(p.replaceFirst(RegExp(r'\.mp4$'), '.srt'));
+      if (await srt.exists()) await webdavPut(srt);
+      _wdPending.remove(p);
+    }
+  }
+
+  void _dailyCheck() {
+    final n = DateTime.now();
+    if (_dailyHour >= 0 &&
+        n.hour == _dailyHour &&
+        n.minute == 0 &&
+        _lastSummaryDay != n.day) {
+      _lastSummaryDay = n.day;
+      _sendDaily();
+    }
+  }
+
+  Future<void> _sendDaily() async {
+    try {
+      final base = await getApplicationDocumentsDirectory();
+      final dir = Directory('${base.path}/events');
+      final names = <String>[];
+      if (await dir.exists()) {
+        await for (final e in dir.list()) {
+          if (e is File && !e.path.endsWith('_b.png')) {
+            names.add(e.path.split('/').last);
+          }
+        }
+      }
+      final d = summarizeEvents(names, DateTime.now());
+      PushQueue.send('ملخص اليوم', d.text('اليوم'));
+    } catch (_) {}
+  }
+
+  /// One small frame every N minutes (played back in the library).
+  Future<void> _tlTick() async {
+    if (_tl <= 0 || _stream == null) return;
+    final now = DateTime.now();
+    if (now.difference(_lastTl).inSeconds < _tl * 60) return;
+    _lastTl = now;
+    try {
+      final tr = _stream!.getVideoTracks();
+      if (tr.isEmpty) return;
+      final png = (await tr.first.captureFrame()).asUint8List();
+      final th = await _thumb(png, 256);
+      if (th == null) return;
+      final base = await getApplicationDocumentsDirectory();
+      final dir = Directory('${base.path}/timelapse');
+      if (!await dir.exists()) await dir.create(recursive: true);
+      await File('${dir.path}/tl_${fmtFile(now)}.png').writeAsBytes(th);
+      final files = <File>[];
+      var total = 0;
+      await for (final e in dir.list()) {
+        if (e is File) {
+          files.add(e);
+          total += await e.length();
+        }
+      }
+      if (total > 150 * 1024 * 1024) {
+        files.sort((a, b) => a.path.compareTo(b.path));
+        for (final f in files) {
+          if (total <= 120 * 1024 * 1024) break;
+          total -= await f.length();
+          try {
+            await f.delete();
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+
+  void _toggleChargeStart(bool v) {
+    setState(() => _chargeStart = v);
+    saveSettings({'chargeStart': v});
+    _svc
+        .invokeMethod('config', {'always': _always, 'pin': _pin, 'charge': v})
+        .catchError((_) {});
+  }
+
   void _showQr() {
     final cands = _ips.isEmpty ? [MapEntry('wifi', _ip)] : _ips;
     var sel = cands.indexWhere((e) => e.value == _ip);
     if (sel < 0) sel = 0;
+    var useView = false;
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -2459,7 +3567,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
                 borderRadius: BorderRadius.circular(14),
               ),
               child: QrImageView(
-                data: 'LANCAM|${cands[sel].value}|$kPort|$_pin',
+                data: 'LANCAM|${cands[sel].value}|$kPort|${useView ? _viewPin : _pin}',
                 version: QrVersions.auto,
                 size: 210,
                 backgroundColor: Colors.white,
@@ -2469,6 +3577,16 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
             Text('${cands[sel].value}  (${cands[sel].key})',
                 textDirection: TextDirection.ltr,
                 style: const TextStyle(fontSize: 12, color: Colors.white70)),
+            Wrap(spacing: 6, children: [
+              ChoiceChip(
+                  label: const Text('تحكم كامل', style: TextStyle(fontSize: 11)),
+                  selected: !useView,
+                  onSelected: (_) => setM(() => useView = false)),
+              ChoiceChip(
+                  label: const Text('مشاهدة فقط', style: TextStyle(fontSize: 11)),
+                  selected: useView,
+                  onSelected: (_) => setM(() => useView = true)),
+            ]),
             if (cands.length > 1)
               Wrap(spacing: 6, children: [
                 for (var i = 0; i < cands.length; i++)
@@ -2717,8 +3835,10 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     if (!Platform.isAndroid) return; // flutter_webrtc recorder: Android only
     if (_recording) {
       await _rec?.stop();
+      final donePath = _recPath;
       await _stopSrt();
       if (mounted) setState(() => _recording = false);
+      if (!_dropping) _wdUpload(donePath);
       _enforceLoop();
       return;
     }
@@ -2747,6 +3867,8 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     _loopTimer?.cancel();
     _soundTimer?.cancel();
     _preTimer?.cancel();
+    _pushTimer?.cancel();
+    _tlTimer?.cancel();
     _sirenTimer?.cancel();
     _closeProbe();
     _now.dispose();
@@ -2896,6 +4018,18 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
                 },
               ),
             ),
+            const SizedBox(height: 8),
+            InfoRow(
+              label: 'رمز المشاهدة فقط',
+              value: _viewPin,
+              trailing: IconButton(
+                icon: const Icon(Icons.refresh_rounded, size: 20),
+                onPressed: () {
+                  setState(() => _viewPin = _newPin());
+                  saveSettings({'viewpin': _viewPin});
+                },
+              ),
+            ),
             const SizedBox(height: 10),
             Row(children: [
               Container(
@@ -2994,6 +4128,25 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
                       style: TextStyle(fontSize: 11, color: Colors.white54)),
                   value: _always,
                   onChanged: _toggleAlways,
+                ),
+              ),
+            if (Platform.isAndroid && _always)
+              Container(
+                margin: const EdgeInsets.only(bottom: 10),
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                decoration: BoxDecoration(
+                  color: kBg,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: SwitchListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('بدء الكاميرا عند الشحن',
+                      style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+                  subtitle: const Text('وصّل الشاحن فتبدأ الكاميرا تلقائياً',
+                      style: TextStyle(fontSize: 11, color: Colors.white54)),
+                  value: _chargeStart,
+                  onChanged: _toggleChargeStart,
                 ),
               ),
             if (Platform.isAndroid && _always) _diagBox(),
@@ -3193,6 +4346,23 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
   DateTime _lastMove = DateTime.fromMillisecondsSinceEpoch(0);
   bool _barOn = false;
   Timer? _barTimer;
+  String _role = 'admin'; // admin | view (view-only PIN)
+  bool _backupOn = false;
+  bool _backingUp = false;
+  static const Map<String, Map<String, dynamic>> _profiles = {
+    'منزل': {
+      'on': true, 'rec': false, 'sens': 1, 'filter': true,
+      'son': false, 'sched': false, 'pre': false,
+    },
+    'غرفة طفل': {
+      'on': false, 'son': true, 'sens': 2, 'sched': false,
+      'rec': false, 'pre': false,
+    },
+    'متجر': {
+      'on': true, 'sens': 1, 'filter': true, 'rec': true, 'loop': 5120,
+      'son': false, 'sched': true, 'sh': 20, 'eh': 8, 'pre': false,
+    },
+  };
   // security (motion / zones / events)
   Map<String, dynamic> _cfg = {};
   final List<_Evt> _events = [];
@@ -3234,6 +4404,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
         _alertHap = (s['alertHaptic'] as bool?) ?? true;
         _autoRetry = (s['autoRetry'] as bool?) ?? true;
         _muted = s['muteStart'] == true;
+        _backupOn = s['autoBackup'] == true;
       });
       if (s['keepOn'] == false) WakelockPlus.disable();
       if (widget.autoConnect && widget.initialIp != null) {
@@ -3447,6 +4618,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
           _isConnected = live;
         });
         if (live) {
+          if (_backupOn) _autoBackup();
           _retryN = 0;
           _wasLive = true;
           _lostTimer?.cancel();
@@ -3485,6 +4657,9 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
             break;
           case 'cfg':
             if (mounted) setState(() => _cfg = Map<String, dynamic>.from(d));
+            break;
+          case 'role':
+            if (mounted) setState(() => _role = '${d['role']}');
             break;
           case 'motion':
             _onMotion(d as Map);
@@ -3572,6 +4747,67 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
 
   /// Link quality as measured on this phone (RTT + packet loss).
   int _thumbTick = 0;
+
+  /// Copies new camera recordings to Photos (once per connection).
+  Future<void> _autoBackup() async {
+    if (_backingUp || widget.screen) return;
+    _backingUp = true;
+    final ip = _ipCtl.text.trim();
+    final c = tlsClient()..connectionTimeout = const Duration(seconds: 5);
+    try {
+      final st = await loadSettings();
+      final key = 'backed_${ip.replaceAll('.', '_')}';
+      final done = <String>{
+        for (final e in ((st[key] as List?) ?? const [])) '$e',
+      };
+      Uri u(String path, [Map<String, String> q = const {}]) {
+        final qp = {'pin': _pinCtl.text, ...q};
+        return kTls
+            ? Uri.https('$ip:$kPort', path, qp)
+            : Uri.http('$ip:$kPort', path, qp);
+      }
+
+      final res = await (await c.getUrl(u('/lib/list'))).close();
+      if (res.statusCode != 200) {
+        await res.drain();
+        return;
+      }
+      final items = (jsonDecode(await res.transform(utf8.decoder).join()) as List)
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .where((e) => e['k'] == 'rec')
+          .toList();
+      final camNow = DateTime.now().millisecondsSinceEpoch + _camOffsetMs;
+      var n = 0;
+      for (final it in items) {
+        final name = '${it['n']}';
+        if (done.contains(name)) continue;
+        if (camNow - (it['t'] as num).toInt() < 60000) continue; // still being written
+        final r = await (await c.getUrl(u('/lib/file', {'k': 'rec', 'n': name}))).close();
+        if (r.statusCode != 200) {
+          await r.drain();
+          continue;
+        }
+        final dir = await getTemporaryDirectory();
+        final f = File('${dir.path}/$name');
+        final sink = f.openWrite();
+        await sink.addStream(r);
+        await sink.close();
+        if (!await Gal.hasAccess()) await Gal.requestAccess();
+        await Gal.putVideo(f.path);
+        try {
+          await f.delete();
+        } catch (_) {}
+        done.add(name);
+        n++;
+        await saveSettings({key: done.toList()});
+      }
+      if (n > 0 && mounted) _snack('تم نسخ $n تسجيل إلى الصور تلقائياً');
+    } catch (_) {
+    } finally {
+      c.close(force: true);
+      _backingUp = false;
+    }
+  }
 
   /// Keep a small last-seen picture per camera (used by the multi-camera grid).
   Future<void> _saveThumb() async {
@@ -3917,6 +5153,18 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
                   children: [
                     const Text('الأمان والمراقبة الذكية',
                         style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 8),
+                    Wrap(spacing: 8, children: [
+                      for (final p in _profiles.entries)
+                        ActionChip(
+                          avatar: const Icon(Icons.auto_fix_high_rounded, size: 16),
+                          label: Text(p.key),
+                          onPressed: () {
+                            cfg(Map<String, dynamic>.from(p.value));
+                            _snack('تم تطبيق ملف "${p.key}"');
+                          },
+                        ),
+                    ]),
                     SwitchListTile(
                       contentPadding: EdgeInsets.zero,
                       title: const Text('كشف الحركة'),
@@ -4091,6 +5339,16 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
                           onSelected: android ? (_) => cfg({'loop': v}) : null,
                         ),
                     ]),
+                    const Divider(),
+                    const Text('تصوير زمني (لقطة كل)'),
+                    Wrap(spacing: 8, children: [
+                      for (final v in const [0, 1, 2, 5, 10])
+                        ChoiceChip(
+                          label: Text(v == 0 ? 'إيقاف' : '$v د'),
+                          selected: ((_cfg['tl'] as num?) ?? 0).toInt() == v,
+                          onSelected: (_) => cfg({'tl': v}),
+                        ),
+                    ]),
                     if (_cfg['rec'] == true && loop == 0)
                       const Padding(
                         padding: EdgeInsets.only(top: 8),
@@ -4263,6 +5521,9 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
             setState(() => _status = 'محاولات خاطئة كثيرة — انتظر 5 دقائق');
             ws.close();
             break;
+          case 'role':
+            setState(() => _role = '${d['role']}');
+            break;
         }
       } else if (m is List<int>) {
         final b = m is Uint8List ? m : Uint8List.fromList(m);
@@ -4340,7 +5601,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
         return Listener(
           behavior: HitTestBehavior.opaque,
           onPointerDown: (e) {
-            if (_ptr != null) return;
+            if (_ptr != null || _role == 'view') return;
             final n = _toNorm(e.localPosition, box);
             if (n == null) return;
             _ptr = e.pointer;
@@ -4459,7 +5720,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
               ),
             ),
           ),
-          if (_barOn)
+          if (_barOn && _role != 'view')
             Positioned(
               left: 0,
               right: 0,
@@ -4640,7 +5901,49 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  Widget _controls({required bool dark}) => Wrap(
+  Widget _controls({required bool dark}) {
+    if (_role != 'view') return _controlsAll(dark: dark);
+    return Wrap(
+      alignment: WrapAlignment.spaceEvenly,
+      spacing: 6,
+      runSpacing: 6,
+      children: [
+        CtlButton(
+            icon: _muted ? Icons.volume_off : Icons.volume_up,
+            label: 'الصوت',
+            active: _muted,
+            dark: dark,
+            onTap: _toggleMute),
+        CtlButton(
+            icon: Icons.photo_camera_rounded,
+            label: 'لقطة',
+            dark: dark,
+            onTap: _shot),
+        CtlButton(
+            icon: Icons.nightlight_round,
+            label: 'ليلي',
+            active: _night > 0,
+            dark: dark,
+            onTap: _tools),
+        CtlButton(
+            icon: Icons.video_library_rounded,
+            label: 'التسجيلات',
+            dark: dark,
+            onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                    builder: (_) => LibraryPage(
+                        ip: _ipCtl.text.trim(), pin: _pinCtl.text)))),
+        CtlButton(
+            icon: _wide ? Icons.fullscreen_exit : Icons.fullscreen,
+            label: _wide ? 'تصغير' : 'عريض',
+            dark: dark,
+            onTap: () => _setWide(!_wide)),
+      ],
+    );
+  }
+
+  Widget _controlsAll({required bool dark}) => Wrap(
         alignment: WrapAlignment.spaceEvenly,
         spacing: 6,
         runSpacing: 6,
@@ -5676,6 +6979,8 @@ class _LibraryPageState extends State<LibraryPage> {
   String? _err;
   final Map<String, Uint8List> _thumbs = {};
   final Map<String, double> _prog = {};
+  List<Map<String, dynamic>> _tlDays = [];
+  String _role = 'admin';
 
   @override
   void initState() {
@@ -5712,6 +7017,19 @@ class _LibraryPageState extends State<LibraryPage> {
           .map((e) => Map<String, dynamic>.from(e as Map))
           .toList();
       l.sort((a, b) => (b['t'] as num).compareTo(a['t'] as num));
+      _role = res.headers.value('x-role') ?? 'admin';
+      try {
+        final r2 = await _get(c, '/lib/tl');
+        if (r2.statusCode == 200) {
+          final b2 = await r2.transform(utf8.decoder).join();
+          _tlDays = (jsonDecode(b2) as List)
+              .map((e) => Map<String, dynamic>.from(e as Map))
+              .toList()
+            ..sort((a, b) => '${b['d']}'.compareTo('${a['d']}'));
+        } else {
+          await r2.drain();
+        }
+      } catch (_) {}
       if (!mounted) return;
       setState(() {
         _items = l;
@@ -5815,7 +7133,10 @@ class _LibraryPageState extends State<LibraryPage> {
     try {
       final res = await _get(c, '/lib/del', {'k': '${it['k']}', 'n': '${it['n']}'});
       await res.drain();
-      if (mounted) setState(() => _items.remove(it));
+      if (mounted) {
+        setState(() => _items.remove(it));
+        if (it['k'] == 'tl') _load();
+      }
     } catch (_) {
       _snack('تعذّر الحذف');
     } finally {
@@ -5866,6 +7187,64 @@ class _LibraryPageState extends State<LibraryPage> {
   @override
   Widget build(BuildContext context) {
     final rows = <Widget>[];
+    final names = [for (final it in _items) if (it['k'] == 'evt') '${it['n']}'];
+    final today = summarizeEvents(names, DateTime.now());
+    final yest = summarizeEvents(names, DateTime.now().subtract(const Duration(days: 1)));
+    if (names.isNotEmpty) {
+      rows.add(Container(
+        margin: const EdgeInsets.only(top: 12, bottom: 4),
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: kSurface,
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('ملخص الأحداث',
+              style: TextStyle(fontWeight: FontWeight.w800)),
+          const SizedBox(height: 6),
+          Text(today.text('اليوم'),
+              style: const TextStyle(fontSize: 12, color: Colors.white70, height: 1.6)),
+          Text(yest.text('أمس'),
+              style: const TextStyle(fontSize: 12, color: Colors.white54, height: 1.6)),
+        ]),
+      ));
+    }
+    for (final d in _tlDays) {
+      rows.add(Container(
+        margin: const EdgeInsets.only(top: 8),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: kSurface,
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Row(children: [
+          const Icon(Icons.slow_motion_video_rounded, color: kAccent),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('تصوير زمني ${d['d']}',
+                  textDirection: TextDirection.ltr,
+                  style: const TextStyle(fontWeight: FontWeight.w700)),
+              Text('${d['n']} لقطة',
+                  style: const TextStyle(fontSize: 11, color: Colors.white54)),
+            ]),
+          ),
+          IconButton(
+            icon: const Icon(Icons.play_circle_fill_rounded),
+            onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                    builder: (_) => TimelapsePage(
+                        ip: widget.ip, pin: widget.pin, day: '${d['d']}'))),
+          ),
+          if (_role == 'admin')
+            IconButton(
+              icon: const Icon(Icons.delete_outline_rounded),
+              onPressed: () => _delete({'k': 'tl', 'n': d['d']}),
+            ),
+        ]),
+      ));
+    }
     String? day;
     for (final it in _items) {
       final t = DateTime.fromMillisecondsSinceEpoch((it['t'] as num).toInt());
@@ -5913,10 +7292,11 @@ class _LibraryPageState extends State<LibraryPage> {
               tooltip: 'تنزيل إلى الصور',
               onPressed: p != null ? null : () => _download(it),
             ),
-            IconButton(
-              icon: const Icon(Icons.delete_outline_rounded),
-              onPressed: () => _delete(it),
-            ),
+            if (_role == 'admin')
+              IconButton(
+                icon: const Icon(Icons.delete_outline_rounded),
+                onPressed: () => _delete(it),
+              ),
           ]),
         ));
       } else {
@@ -5957,10 +7337,11 @@ class _LibraryPageState extends State<LibraryPage> {
                     style: const TextStyle(fontSize: 11, color: Colors.white54)),
               ]),
             ),
-            IconButton(
-              icon: const Icon(Icons.delete_outline_rounded),
-              onPressed: () => _delete(it),
-            ),
+            if (_role == 'admin')
+              IconButton(
+                icon: const Icon(Icons.delete_outline_rounded),
+                onPressed: () => _delete(it),
+              ),
           ]),
         ));
       }
@@ -5992,4 +7373,170 @@ class _LibraryPageState extends State<LibraryPage> {
                       children: rows),
     );
   }
+}
+
+// ───────────────── Time-lapse player (frames served by the camera) ─────────────────
+class TimelapsePage extends StatefulWidget {
+  const TimelapsePage(
+      {super.key, required this.ip, required this.pin, required this.day});
+  final String ip;
+  final String pin;
+  final String day;
+  @override
+  State<TimelapsePage> createState() => _TimelapsePageState();
+}
+
+class _TimelapsePageState extends State<TimelapsePage> {
+  List<String> _names = [];
+  final Map<int, Uint8List> _frames = {};
+  int _i = 0;
+  bool _play = true;
+  int _fps = 8;
+  Timer? _timer;
+  bool _loading = true;
+  String? _err;
+  bool _dead = false;
+
+  Uri _u(String path, Map<String, String> q) {
+    final qp = {'pin': widget.pin, ...q};
+    return kTls
+        ? Uri.https('${widget.ip}:$kPort', path, qp)
+        : Uri.http('${widget.ip}:$kPort', path, qp);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _dead = true;
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final c = tlsClient()..connectionTimeout = const Duration(seconds: 5);
+    try {
+      final req = await c.getUrl(_u('/lib/tl', {'d': widget.day}));
+      final res = await req.close();
+      if (res.statusCode != 200) throw 'fail';
+      final body = await res.transform(utf8.decoder).join();
+      _names = (jsonDecode(body) as List).map((e) => '$e').toList();
+      if (mounted) setState(() => _loading = false);
+      _startTimer();
+      await _fetchAll(c);
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _err = 'تعذّر تحميل التصوير الزمني';
+        });
+      }
+    } finally {
+      c.close(force: true);
+    }
+  }
+
+  Future<void> _fetchAll(HttpClient c) async {
+    for (var i = 0; i < _names.length && !_dead; i++) {
+      try {
+        final req =
+            await c.getUrl(_u('/lib/file', {'k': 'tl', 'n': _names[i]}));
+        final res = await req.close();
+        if (res.statusCode != 200) {
+          await res.drain();
+          continue;
+        }
+        final b = BytesBuilder();
+        await for (final chunk in res) {
+          b.add(chunk);
+        }
+        _frames[i] = b.takeBytes();
+        if (mounted && i == _i) setState(() {});
+      } catch (_) {}
+    }
+  }
+
+  void _startTimer() {
+    _timer?.cancel();
+    _timer = Timer.periodic(Duration(milliseconds: 1000 ~/ _fps), (_) {
+      if (!_play || _names.isEmpty || !mounted) return;
+      final n = (_i + 1) % _names.length;
+      if (_frames.containsKey(n)) setState(() => _i = n);
+    });
+  }
+
+  String _label(int i) {
+    if (i < 0 || i >= _names.length) return '';
+    final m = RegExp(r'_(\d{2})-(\d{2})-\d{2}\.png$').firstMatch(_names[i]);
+    return m == null ? '' : '${m.group(1)}:${m.group(2)}';
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: Text('تصوير زمني ${widget.day}')),
+        body: _loading
+            ? const Center(child: CircularProgressIndicator())
+            : _err != null
+                ? Center(child: Text(_err!))
+                : _names.isEmpty
+                    ? const Center(child: Text('لا توجد لقطات'))
+                    : Column(children: [
+                        Expanded(
+                          child: Container(
+                            color: Colors.black,
+                            width: double.infinity,
+                            child: _frames[_i] == null
+                                ? const Center(child: CircularProgressIndicator())
+                                : Image.memory(_frames[_i]!,
+                                    gaplessPlayback: true, fit: BoxFit.contain),
+                          ),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          child: Column(children: [
+                            Row(children: [
+                              IconButton(
+                                icon: Icon(_play
+                                    ? Icons.pause_rounded
+                                    : Icons.play_arrow_rounded),
+                                onPressed: () => setState(() => _play = !_play),
+                              ),
+                              Text(_label(_i),
+                                  textDirection: TextDirection.ltr,
+                                  style: const TextStyle(fontWeight: FontWeight.w700)),
+                              const Spacer(),
+                              Text('${_frames.length}/${_names.length}',
+                                  style: const TextStyle(
+                                      fontSize: 11, color: Colors.white54)),
+                              const SizedBox(width: 10),
+                              for (final f in const [4, 8, 16])
+                                Padding(
+                                  padding: const EdgeInsets.only(left: 6),
+                                  child: ChoiceChip(
+                                    label: Text('×${f ~/ 4}'),
+                                    selected: _fps == f,
+                                    onSelected: (_) {
+                                      setState(() => _fps = f);
+                                      _startTimer();
+                                    },
+                                  ),
+                                ),
+                            ]),
+                            Slider(
+                              value: _i.toDouble().clamp(0, (_names.length - 1).toDouble()),
+                              min: 0,
+                              max: (_names.length - 1).toDouble().clamp(1, 100000),
+                              onChanged: (v) => setState(() {
+                                _i = v.round();
+                                _play = false;
+                              }),
+                            ),
+                          ]),
+                        ),
+                      ]),
+      );
 }

@@ -5,12 +5,18 @@ import 'dart:math';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:flutter/material.dart';
+import 'package:flutter/material.dart' hide Text;
+import 'package:flutter/widgets.dart' as w show Text;
 import 'package:flutter/services.dart';
 import 'package:battery_plus/battery_plus.dart' show Battery, BatteryState;
 import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:flutter_tts/flutter_tts.dart' show FlutterTts;
 import 'package:gal/gal.dart' show Gal;
+import 'package:local_auth/local_auth.dart'
+    show AuthenticationOptions, LocalAuthentication;
+import 'package:share_plus/share_plus.dart' show Share, XFile;
+import 'package:url_launcher/url_launcher.dart' show LaunchMode, launchUrl;
 import 'package:mobile_scanner/mobile_scanner.dart'
     show BarcodeCapture, BarcodeFormat, MobileScanner, MobileScannerController;
 import 'package:path_provider/path_provider.dart';
@@ -46,7 +52,10 @@ final ValueNotifier<int> kThumbRev = ValueNotifier<int>(0);
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await loadTls();
-  runApp(MaterialApp(
+  applyUiPrefs(await loadSettings());
+  runApp(ValueListenableBuilder<int>(
+    valueListenable: kUiRev,
+    builder: (_, __, ___) => MaterialApp(
       navigatorKey: kNav,
       debugShowCheckedModeBanner: false,
       title: 'LAN Cam',
@@ -63,10 +72,10 @@ Future<void> main() async {
           scrolledUnderElevation: 0,
         ),
       ),
-      builder: (context, child) =>
-          Directionality(textDirection: TextDirection.rtl, child: child!),
+      builder: uiShell,
       home: const Home(),
-    ));
+    ),
+  ));
 }
 
 // ───────────────────────────── Helpers ─────────────────────────────
@@ -1755,7 +1764,130 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
+  Widget build(BuildContext context) => ValueListenableBuilder<int>(
+        valueListenable: kUiRev,
+        builder: (_, __, ___) => kSimple ? _simpleHome() : _advancedHome(),
+      );
+
+  Widget _big(IconData icon, String title, String sub, Color col,
+          VoidCallback onTap) =>
+      Expanded(
+        child: GestureDetector(
+          onTap: onTap,
+          child: Container(
+            width: double.infinity,
+            margin: const EdgeInsets.only(bottom: 14),
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: kSurface,
+              borderRadius: BorderRadius.circular(26),
+              border: Border.all(color: col.withAlpha(128), width: 2),
+            ),
+            child: Row(children: [
+              Container(
+                width: 74,
+                height: 74,
+                decoration: BoxDecoration(
+                    color: col.withAlpha(46), shape: BoxShape.circle),
+                child: Icon(icon, size: 42, color: col),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(title,
+                          style: const TextStyle(
+                              fontSize: 28, fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 4),
+                      Text(sub,
+                          style: const TextStyle(
+                              fontSize: 15, color: Colors.white60)),
+                    ]),
+              ),
+            ]),
+          ),
+        ),
+      );
+
+  Future<void> _simpleWatch() async {
+    final st = await loadSettings();
+    final l = st['cams'];
+    if (!mounted) return;
+    if (l is List && l.length > 1) {
+      Navigator.push(context,
+          MaterialPageRoute(builder: (_) => const MultiViewPage()));
+    } else if (l is List && l.length == 1) {
+      final c = Map<String, dynamic>.from(l[0] as Map);
+      Navigator.push(
+          context,
+          MaterialPageRoute(
+              builder: (_) => ViewerPage(
+                  initialIp: '${c['ip']}',
+                  initialPin: '${c['pin']}',
+                  autoConnect: true)));
+    } else if ('${st['ip'] ?? ''}'.isNotEmpty) {
+      Navigator.push(
+          context,
+          MaterialPageRoute(
+              builder: (_) => ViewerPage(
+                  initialIp: '${st['ip']}',
+                  initialPin: '${st['pin'] ?? ''}',
+                  autoConnect: true)));
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('لا توجد كاميرا محفوظة — أضف واحدة أولاً')));
+    }
+  }
+
+  Future<void> _simpleAdd() async {
+    final cam = await addCamFromQr(context);
+    if (cam == null || !mounted) return;
+    Navigator.push(
+        context,
+        MaterialPageRoute(
+            builder: (_) => ViewerPage(
+                initialIp: '${cam['ip']}',
+                initialPin: '${cam['pin']}',
+                autoConnect: true)));
+  }
+
+  Widget _simpleHome() => Scaffold(
+        body: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(18, 14, 18, 8),
+            child: Column(children: [
+              const LogoMark(size: 64),
+              const SizedBox(height: 6),
+              const Text('LAN Cam',
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
+              const SizedBox(height: 14),
+              _big(Icons.visibility_rounded, 'شاهد', 'افتح الكاميرا الآن',
+                  kAccent, _simpleWatch),
+              _big(Icons.add_a_photo_rounded, 'أضف كاميرا',
+                  'امسح رمز QR من الكاميرا', kGreen, _simpleAdd),
+              _big(
+                  Icons.help_outline_rounded,
+                  'ساعدني',
+                  'حل المشاكل وشرح الاستخدام',
+                  const Color(0xFFFBBF24),
+                  () => Navigator.push(context,
+                      MaterialPageRoute(builder: (_) => const HelpHubPage()))),
+              TextButton(
+                onPressed: () {
+                  saveSettings({'simple': false}).then((_) async {
+                    applyUiPrefs(await loadSettings());
+                  });
+                },
+                child: const Text('الوضع المتقدم'),
+              ),
+            ]),
+          ),
+        ),
+      );
+
+  Widget _advancedHome() => Scaffold(
         body: Container(
           decoration: const BoxDecoration(
             gradient: LinearGradient(
@@ -1858,6 +1990,12 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
                         onPressed: () => Navigator.push(context,
                             MaterialPageRoute(builder: (_) => const SetupWizard())),
                       ),
+                      TextButton.icon(
+                        icon: const Icon(Icons.help_outline_rounded, size: 18),
+                        label: const Text('ساعدني'),
+                        onPressed: () => Navigator.push(context,
+                            MaterialPageRoute(builder: (_) => const HelpHubPage())),
+                      ),
                     ]),
                     const SizedBox(height: 16),
                     Wrap(
@@ -1917,6 +2055,7 @@ class _SettingsPageState extends State<SettingsPage> {
   void _set(String k, Object v) {
     setState(() => _s[k] = v);
     saveSettings({k: v});
+    applyUiPrefs(_s);
   }
 
   Widget _field(String label, String key,
@@ -2037,6 +2176,71 @@ class _SettingsPageState extends State<SettingsPage> {
                 '• للمشاهدة من خارج البيت: ثبّت Tailscale (مجاني) على الهاتفين واكتب عنوان 100.x الظاهر في الكاميرا. لا تفتح المنافذ 8080/8081 في الراوتر.',
                 style: TextStyle(fontSize: 12, color: Colors.white70, height: 1.6),
               ),
+            ),
+          ]),
+          _group('الواجهة وإمكانية الوصول', Icons.accessibility_new_rounded, [
+            _chips<bool>('واجهة مبسّطة (3 أزرار)', 'simple', false,
+                [false, true], ['إيقاف', 'تشغيل']),
+            _chips<String>('اللغة', 'lang', 'auto',
+                ['auto', 'ar', 'en', 'fr', 'tr', 'ur'],
+                ['تلقائي', 'العربية', 'English', 'Français', 'Türkçe', 'اردو']),
+            _chips<double>('حجم الخط', 'fontScale', 1.0, [1.0, 1.25, 1.5],
+                ['عادي', 'كبير', 'كبير جداً']),
+            _chips<bool>('تباين عالٍ', 'contrast', false, [false, true],
+                ['إيقاف', 'تشغيل']),
+            _chips<bool>('قراءة التنبيهات بصوت عالٍ', 'speak', false,
+                [false, true], ['إيقاف', 'تشغيل']),
+          ]),
+          _group('قفل التطبيق', Icons.lock_rounded, [
+            _chips<bool>('قفل التطبيق (بصمة / وجه / رمز)', 'appLock', false,
+                [false, true], ['إيقاف', 'تشغيل']),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.pin_rounded),
+              title: const Text('تعيين رمز القفل'),
+              subtitle: const Text('رمز من 4 إلى 6 أرقام',
+                  style: TextStyle(fontSize: 11, color: Colors.white54)),
+              onTap: () async {
+                final ctl = TextEditingController();
+                final v = await showDialog<String>(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    backgroundColor: kSurface,
+                    title: const Text('تعيين رمز القفل'),
+                    content: TextField(
+                      controller: ctl,
+                      keyboardType: TextInputType.number,
+                      obscureText: true,
+                      maxLength: 6,
+                      inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                    ),
+                    actions: [
+                      TextButton(
+                          onPressed: () => Navigator.pop(ctx),
+                          child: const Text('إلغاء')),
+                      FilledButton(
+                          onPressed: () => Navigator.pop(ctx, ctl.text),
+                          child: const Text('حفظ')),
+                    ],
+                  ),
+                );
+                if (v != null && v.length >= 4) {
+                  _set('appLockPin', v);
+                } else if (v != null) {
+                  _toast('رمز من 4 إلى 6 أرقام');
+                }
+              },
+            ),
+          ]),
+          _group('أتمتة (اختصارات iOS)', Icons.bolt_rounded, [
+            _chips<bool>('تفعيل رابط الأتمتة (المنفذ 8082، غير مشفّر)', 'autoSrv',
+                false, [false, true], ['إيقاف', 'تشغيل']),
+            const Padding(
+              padding: EdgeInsets.only(bottom: 12),
+              child: Text(
+                  'مثال: في تطبيق "اختصارات" أنشئ أتمتة "عند الاتصال بشبكة الواي فاي" تُنفّذ "الحصول على محتويات URL":\nhttp://عنوان-الكاميرا:8082/mode?pin=الرمز&home=1\nوأخرى عند المغادرة بـ home=0. يُوقف الكشف أثناء وجودك بالمنزل.',
+                  textDirection: TextDirection.ltr,
+                  style: TextStyle(fontSize: 11, color: Colors.white60, height: 1.6)),
             ),
           ]),
           _group('إشعارات خارجية (والتطبيق مغلق)', Icons.send_rounded, [
@@ -2334,6 +2538,17 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   int _alertGap = 20;
   bool get _recShown => _recording && !_rolling;
   bool _dropping = false;
+  int _homeUntil = 0; // 0 off, -1 until switched off, else expiry (ms)
+  HttpServer? _autoSrv;
+  final List<Map<String, dynamic>> _log = [];
+  int _care = 0;
+  DateTime _careBase = DateTime.now();
+  bool _careAlerted = false;
+  double _lastLvl = 0;
+  DateTime _lastLvlSent = DateTime.fromMillisecondsSinceEpoch(0);
+  bool get _homeActive =>
+      _homeUntil == -1 ||
+      (_homeUntil > 0 && DateTime.now().millisecondsSinceEpoch < _homeUntil);
   // view-only PIN, charge start, notifications, time-lapse
   String _viewPin = '';
   bool _chargeStart = false;
@@ -2387,6 +2602,9 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     _lockMin = (s['lockMin'] as int?) ?? 5;
     _alertGap = (s['alertGap'] as int?) ?? 20;
     _chargeStart = s['chargeStart'] == true;
+    _homeUntil = (s['m_home'] as int?) ?? 0;
+    _care = (s['m_care'] as int?) ?? 0;
+    _careBase = DateTime.now();
     _tl = (s['m_tl'] as int?) ?? 0;
     _dailyHour = (s['dailyHour'] as int?) ?? -1;
     _viewPin = (s['viewpin'] as String?) ?? '';
@@ -2497,6 +2715,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
             _fails.remove(remote);
             authed = true;
             role = rl;
+            _logAccess(remote, rl, 'live');
             _ws = ws;
             ws.add(jsonEncode({'type': 'role', 'role': rl}));
             await _answer(ws, d['sdp'] as String);
@@ -2525,6 +2744,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
             _fails.remove(remote);
             authed = true;
             role = rl;
+            _logAccess(remote, rl, 'screen');
             ws.add(jsonEncode({'type': 'role', 'role': rl}));
             await _attachScreen(ws);
             break;
@@ -2558,11 +2778,14 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     _pushTimer = Timer.periodic(const Duration(seconds: 30), (_) {
       PushQueue.flush();
       _wdFlush();
+      _careCheck();
       if (++_aliveSave % 2 == 0) {
         saveSettings({'aliveTs': DateTime.now().millisecondsSinceEpoch});
       }
     });
     _tlTimer = Timer.periodic(const Duration(seconds: 20), (_) => _tlTick());
+    if (s['autoSrv'] == true) _startAutoServer();
+    _loadLog();
     _soundTimer =
         Timer.periodic(const Duration(milliseconds: 500), (_) => _soundTick());
     _preTimer = Timer.periodic(const Duration(seconds: 1), (_) => _preTick());
@@ -2750,6 +2973,8 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         'eh': _sEh,
         'pre': _pre,
         'tl': _tl,
+        'home': _homeCode(),
+        'care': _care,
         'person': _mPerson,
         'personAvail': kPersonSupported,
       }));
@@ -2778,6 +3003,19 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     }
     if (d['sched'] is bool) _sched = d['sched'] as bool;
     if (d['pre'] is bool) _pre = d['pre'] as bool;
+    if (d['home'] is num) {
+      final h = (d['home'] as num).toInt();
+      _homeUntil = h == 0
+          ? 0
+          : (h < 0
+              ? -1
+              : DateTime.now().millisecondsSinceEpoch + h * 3600000);
+    }
+    if (d['care'] is num) {
+      _care = (d['care'] as num).toInt().clamp(0, 48).toInt();
+      _careBase = DateTime.now();
+      _careAlerted = false;
+    }
     if (d['tl'] is num) _tl = (d['tl'] as num).toInt().clamp(0, 60).toInt();
     if (d['person'] is bool) _mPerson = d['person'] as bool;
     if (d['sh'] is num) _sSh = (d['sh'] as num).toInt().clamp(0, 23).toInt();
@@ -2790,6 +3028,8 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     _streak = 0;
     saveSettings({
       'm_pre': _pre,
+      'm_home': _homeUntil,
+      'm_care': _care,
       'm_tl': _tl,
       'm_person': _mPerson,
       'm_son': _sOn,
@@ -3041,6 +3281,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
 
   // ───────────── schedule / events / sound / siren / power saving ─────────────
   bool _inSchedule() {
+    if (_homeActive) return false; // "I'm at home": detection paused
     if (!_sched) return true;
     final h = DateTime.now().hour;
     return _sSh <= _sEh ? (h >= _sSh && h < _sEh) : (h >= _sSh || h < _sEh);
@@ -3237,6 +3478,14 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       _soundOk = true;
       _sendCfg();
     }
+    _lastLvl = lvl;
+    final nowL = DateTime.now();
+    if (nowL.difference(_lastLvlSent).inMilliseconds >= 900) {
+      _lastLvlSent = nowL;
+      try {
+        _ws?.add(jsonEncode({'type': 'lvl', 'v': lvl}));
+      } catch (_) {}
+    }
     final mult = const [5.0, 3.5, 2.2][_mSens];
     final minL = const [0.12, 0.08, 0.05][_mSens];
     final thr = max(minL, _ambient * mult);
@@ -3302,6 +3551,12 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     final res = req.response;
     try {
       final path = req.uri.path;
+      if (path == '/web' || path == '/') {
+        res.headers.contentType = ContentType.html;
+        res.write(kWebPage);
+        await res.close();
+        return;
+      }
       if (!path.startsWith('/lib/')) {
         res.write('LAN Cam');
         await res.close();
@@ -3326,6 +3581,16 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       final docsPath = (await getApplicationDocumentsDirectory()).path;
       final evtDir = Directory('$docsPath/events');
       final tlDir = Directory('$docsPath/timelapse');
+      if (path == '/lib/log') {
+        if (role != 'admin') {
+          res.statusCode = 403;
+        } else {
+          res.headers.contentType = ContentType.json;
+          res.write(jsonEncode(_log));
+        }
+        await res.close();
+        return;
+      }
       if (path == '/lib/tl') {
         final names = <String>[];
         if (await tlDir.exists()) {
@@ -3538,6 +3803,101 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         }
       }
     } catch (_) {}
+  }
+
+  int _homeCode() {
+    if (_homeUntil == -1) return -1;
+    final left = _homeUntil - DateTime.now().millisecondsSinceEpoch;
+    return left > 0 ? (left ~/ 3600000) + 1 : 0;
+  }
+
+  /// No movement for N hours (elder care).
+  void _careCheck() {
+    if (_lastMotion.isAfter(_careBase)) {
+      _careBase = _lastMotion;
+      _careAlerted = false;
+    }
+    if (_care <= 0 || !_mOn || !_inSchedule() || _careAlerted) return;
+    if (DateTime.now().difference(_careBase).inMinutes < _care * 60) return;
+    _careAlerted = true;
+    PushQueue.send('لا توجد حركة', 'لا توجد حركة منذ $_care ساعات');
+    try {
+      _ws?.add(jsonEncode({
+        'type': 'motion',
+        'kind': 'care',
+        'ts': DateTime.now().millisecondsSinceEpoch,
+      }));
+    } catch (_) {}
+  }
+
+  /// Plain HTTP link for iOS Shortcuts: /mode?pin=PIN&home=1|0 (or &h=hours).
+  Future<void> _startAutoServer() async {
+    try {
+      _autoSrv = await HttpServer.bind(InternetAddress.anyIPv4, 8082);
+      _autoSrv!.listen((req) async {
+        final remote = req.connectionInfo?.remoteAddress.address ?? '?';
+        final res = req.response;
+        try {
+          final q = req.uri.queryParameters;
+          if (_locked(remote)) {
+            res.statusCode = 429;
+          } else if (req.uri.path == '/mode' && q['pin'] == _pin) {
+            _fails.remove(remote);
+            final h = int.tryParse(q['h'] ?? '') ?? (q['home'] == '1' ? -1 : 0);
+            _applyCfg({'home': h});
+            res.write('ok');
+          } else {
+            _fails.putIfAbsent(remote, () => []).add(DateTime.now());
+            res.statusCode = 403;
+          }
+        } catch (_) {}
+        await res.close();
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _loadLog() async {
+    try {
+      final base = await getApplicationDocumentsDirectory();
+      final f = File('${base.path}/access_log.json');
+      if (await f.exists()) {
+        final l = jsonDecode(await f.readAsString()) as List;
+        _log
+          ..clear()
+          ..addAll(l.map((e) => Map<String, dynamic>.from(e as Map)));
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _logAccess(String ip, String role, String kind) async {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (_log.isNotEmpty &&
+        _log.first['ip'] == ip &&
+        _log.first['role'] == role &&
+        nowMs - (_log.first['t'] as int) < 120000) {
+      return;
+    }
+    _log.insert(0, {'t': nowMs, 'ip': ip, 'role': role, 'kind': kind});
+    if (_log.length > 100) _log.removeLast();
+    try {
+      final base = await getApplicationDocumentsDirectory();
+      await File('${base.path}/access_log.json').writeAsString(jsonEncode(_log));
+    } catch (_) {}
+    final st = await loadSettings();
+    final known = <String>{
+      for (final e in ((st['knownViewers'] as List?) ?? const [])) '$e',
+    };
+    if (known.isEmpty) {
+      known.add(ip); // first ever viewer: remember silently
+      await saveSettings({'knownViewers': known.toList()});
+      return;
+    }
+    if (!known.contains(ip)) {
+      known.add(ip);
+      await saveSettings({'knownViewers': known.toList()});
+      PushQueue.send('مشاهدة جديدة',
+          'جهاز جديد ($ip) دخل بصلاحية ${role == 'admin' ? 'تحكم كامل' : 'مشاهدة فقط'}');
+    }
   }
 
   void _toggleChargeStart(bool v) {
@@ -3869,6 +4229,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     _preTimer?.cancel();
     _pushTimer?.cancel();
     _tlTimer?.cancel();
+    _autoSrv?.close(force: true);
     _sirenTimer?.cancel();
     _closeProbe();
     _now.dispose();
@@ -4073,6 +4434,13 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
                   textAlign: TextAlign.center,
                   style: TextStyle(
                       fontSize: 11, color: kTls ? kGreen : Colors.amber)),
+            ),
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: SelectableText('${kTls ? 'https' : 'http'}://$_ip:$kPort/web',
+                  textAlign: TextAlign.center,
+                  textDirection: TextDirection.ltr,
+                  style: const TextStyle(fontSize: 11, color: Colors.white54)),
             ),
             const SizedBox(height: 10),
             Container(
@@ -4349,6 +4717,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
   String _role = 'admin'; // admin | view (view-only PIN)
   bool _backupOn = false;
   bool _backingUp = false;
+  final _lvlN = ValueNotifier<double>(0);
   static const Map<String, Map<String, dynamic>> _profiles = {
     'منزل': {
       'on': true, 'rec': false, 'sens': 1, 'filter': true,
@@ -4357,6 +4726,10 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
     'غرفة طفل': {
       'on': false, 'son': true, 'sens': 2, 'sched': false,
       'rec': false, 'pre': false,
+    },
+    'حيوان أليف': {
+      'on': true, 'sens': 2, 'filter': false, 'rec': true, 'loop': 2048,
+      'son': false, 'sched': false, 'pre': false,
     },
     'متجر': {
       'on': true, 'sens': 1, 'filter': true, 'rec': true, 'loop': 5120,
@@ -4661,6 +5034,9 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
           case 'role':
             if (mounted) setState(() => _role = '${d['role']}');
             break;
+          case 'lvl':
+            _lvlN.value = numOf(d['v']);
+            break;
           case 'motion':
             _onMotion(d as Map);
             break;
@@ -4703,6 +5079,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
   void _alert(String m) {
     if (_alertHap) HapticFeedback.heavyImpact();
     if (_alertSnd) SystemSound.play(SystemSoundType.alert);
+    Speaker.say(m);
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text(m),
@@ -5009,7 +5386,9 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
       _unread++;
       _alert(kind == 'sound'
           ? 'صوت عالٍ عند الكاميرا'
-          : 'حركة مكتشفة في الكاميرا');
+          : (kind == 'care'
+              ? 'لا توجد حركة منذ فترة طويلة — تحقق من الشخص'
+              : 'حركة مكتشفة في الكاميرا'));
     } catch (_) {}
   }
 
@@ -5292,6 +5671,21 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
                     ),
                     ListTile(
                       contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.history_rounded),
+                      title: const Text('سجل الدخول'),
+                      subtitle: const Text('تُسجَّل كل مشاهدة مع التاريخ والجهاز',
+                          style: TextStyle(fontSize: 11, color: Colors.white54)),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                                builder: (_) => AccessLogPage(
+                                    ip: _ipCtl.text.trim(), pin: _pinCtl.text)));
+                      },
+                    ),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
                       leading: const Icon(Icons.campaign_rounded),
                       title: const Text('تشغيل صفارة على الكاميرا'),
                       subtitle: const Text('نغمة تنبيه واهتزاز لمدة 15 ثانية',
@@ -5337,6 +5731,28 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
                           label: Text(v == 0 ? 'إيقاف' : '${v ~/ 1024} GB'),
                           selected: loop == v,
                           onSelected: android ? (_) => cfg({'loop': v}) : null,
+                        ),
+                    ]),
+                    const Divider(),
+                    const Text('أنا في المنزل (إيقاف الكشف)'),
+                    Wrap(spacing: 8, children: [
+                      for (var i = 0; i < 4; i++)
+                        ChoiceChip(
+                          label: Text(const ['إيقاف', 'ساعتان', '8 ساعات', 'حتى أوقفه'][i]),
+                          selected: homeSel(((_cfg['home'] as num?) ?? 0).toInt(),
+                              const [0, 2, 8, -1][i]),
+                          onSelected: (_) => cfg({'home': const [0, 2, 8, -1][i]}),
+                        ),
+                    ]),
+                    const SizedBox(height: 8),
+                    const Text('رعاية كبار السن: تنبيه إن لم تُرصد حركة'),
+                    Wrap(spacing: 8, children: [
+                      for (var i = 0; i < 5; i++)
+                        ChoiceChip(
+                          label: Text(const ['إيقاف', '2 س', '4 س', '8 س', '12 س'][i]),
+                          selected: ((_cfg['care'] as num?) ?? 0).toInt() ==
+                              const [0, 2, 4, 8, 12][i],
+                          onSelected: (_) => cfg({'care': const [0, 2, 4, 8, 12][i]}),
                         ),
                     ]),
                     const Divider(),
@@ -5448,6 +5864,10 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
         ),
         actions: [
           TextButton(
+            onPressed: () => shareBytes(e.img, 'event.png'),
+            child: const Text('مشاركة'),
+          ),
+          TextButton(
             onPressed: () async {
               try {
                 if (!await Gal.hasAccess()) await Gal.requestAccess();
@@ -5475,6 +5895,11 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
           if (_clockOn && !widget.screen) const SizedBox(height: 5),
           if (_isConnected && !widget.screen)
             HealthBar(h: _health, link: _link),
+          if (_isConnected && !widget.screen && _cfg['son'] == true)
+            Padding(
+              padding: const EdgeInsets.only(top: 5),
+              child: LevelBar(level: _lvlN),
+            ),
         ]),
       );
 
@@ -5884,6 +6309,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
     _clockTimer?.cancel();
     _now.dispose();
     _tc.dispose();
+    _lvlN.dispose();
     _touchPos.dispose();
     _uiImg.value?.dispose();
     _uiImg.dispose();
@@ -7077,7 +7503,7 @@ class _LibraryPageState extends State<LibraryPage> {
   }
 
   /// Download a recording to this phone and put it in Photos.
-  Future<void> _download(Map<String, dynamic> it) async {
+  Future<void> _download(Map<String, dynamic> it, {bool share = false}) async {
     final n = '${it['n']}';
     if (_prog.containsKey(n)) return;
     setState(() => _prog[n] = 0);
@@ -7098,9 +7524,13 @@ class _LibraryPageState extends State<LibraryPage> {
       }
       await sink.flush();
       await sink.close();
-      if (!await Gal.hasAccess()) await Gal.requestAccess();
-      await Gal.putVideo(f.path);
-      _snack('تم تنزيل التسجيل وحفظه في الصور');
+      if (share) {
+        await Share.shareXFiles([XFile(f.path)]);
+      } else {
+        if (!await Gal.hasAccess()) await Gal.requestAccess();
+        await Gal.putVideo(f.path);
+        _snack('تم تنزيل التسجيل وحفظه في الصور');
+      }
     } catch (_) {
       _snack('تعذّر تنزيل التسجيل');
     } finally {
@@ -7165,6 +7595,10 @@ class _LibraryPageState extends State<LibraryPage> {
               textDirection: TextDirection.ltr),
         ]),
         actions: [
+          TextButton(
+            onPressed: () => shareBytes(b, 'event.png'),
+            child: const Text('مشاركة'),
+          ),
           TextButton(
             onPressed: () async {
               try {
@@ -7291,6 +7725,11 @@ class _LibraryPageState extends State<LibraryPage> {
               icon: const Icon(Icons.download_rounded),
               tooltip: 'تنزيل إلى الصور',
               onPressed: p != null ? null : () => _download(it),
+            ),
+            IconButton(
+              icon: const Icon(Icons.share_rounded),
+              tooltip: 'مشاركة',
+              onPressed: p != null ? null : () => _download(it, share: true),
             ),
             if (_role == 'admin')
               IconButton(
@@ -7539,4 +7978,1221 @@ class _TimelapsePageState extends State<TimelapsePage> {
                         ),
                       ]),
       );
+}
+
+// ───────────────── Language / accessibility / simple mode ─────────────────
+const List<String> kLangs = ['ar', 'en', 'fr', 'tr', 'ur'];
+String kLang = 'ar';
+double kFontScale = 1.0;
+bool kContrast = false;
+bool kSpeak = false;
+bool kSimple = false;
+final ValueNotifier<int> kUiRev = ValueNotifier<int>(0);
+bool get kRtl => kLang == 'ar' || kLang == 'ur';
+
+String resolveLang(String? pref) {
+  if (pref != null && kLangs.contains(pref)) return pref;
+  final c = WidgetsBinding.instance.platformDispatcher.locale.languageCode;
+  return kLangs.contains(c) ? c : 'en';
+}
+
+/// Applies language / font size / contrast / simple mode and rebuilds the app.
+void applyUiPrefs(Map<String, dynamic> s) {
+  final l = resolveLang(s['lang'] as String?);
+  final fs = ((s['fontScale'] as num?) ?? 1.0).toDouble();
+  final hc = s['contrast'] == true;
+  final sm = s['simple'] == true;
+  final changed = l != kLang || fs != kFontScale || hc != kContrast || sm != kSimple;
+  kLang = l;
+  kFontScale = fs;
+  kContrast = hc;
+  kSpeak = s['speak'] == true;
+  kSimple = sm;
+  if (changed) kUiRev.value++;
+}
+
+String tr(String s) {
+  if (kLang == 'ar') return s;
+  final l = kTr[s];
+  if (l == null) return s;
+  switch (kLang) {
+    case 'en':
+      return l[0];
+    case 'fr':
+      return l[1];
+    case 'tr':
+      return l[2];
+    default:
+      return l[3];
+  }
+}
+
+class _UiScope extends InheritedWidget {
+  const _UiScope({required this.rev, required super.child});
+  final int rev;
+  @override
+  bool updateShouldNotify(_UiScope old) => old.rev != rev;
+}
+
+/// Drop-in replacement for Flutter's Text that translates known strings.
+class Text extends StatelessWidget {
+  const Text(
+    this.data, {
+    super.key,
+    this.style,
+    this.textAlign,
+    this.textDirection,
+    this.maxLines,
+    this.overflow,
+  });
+  final String data;
+  final TextStyle? style;
+  final TextAlign? textAlign;
+  final TextDirection? textDirection;
+  final int? maxLines;
+  final TextOverflow? overflow;
+
+  @override
+  Widget build(BuildContext context) {
+    context.dependOnInheritedWidgetOfExactType<_UiScope>();
+    return w.Text(tr(data),
+        style: style,
+        textAlign: textAlign,
+        textDirection: textDirection,
+        maxLines: maxLines,
+        overflow: overflow);
+  }
+}
+
+/// Reads alerts aloud (accessibility).
+class Speaker {
+  static FlutterTts? _t;
+  static const _loc = {
+    'ar': 'ar-SA',
+    'en': 'en-US',
+    'fr': 'fr-FR',
+    'tr': 'tr-TR',
+    'ur': 'ur-PK',
+  };
+  static Future<void> say(String text) async {
+    if (!kSpeak) return;
+    try {
+      _t ??= FlutterTts();
+      await _t!.setLanguage(_loc[kLang] ?? 'ar-SA');
+      await _t!.setSpeechRate(0.45);
+      await _t!.speak(tr(text));
+    } catch (_) {}
+  }
+}
+
+/// Wraps the app: language scope, font size, high contrast, app lock.
+Widget uiShell(BuildContext context, Widget? child) {
+  final mq = MediaQuery.of(context);
+  Widget c = LockGate(child: child ?? const SizedBox());
+  if (kContrast) {
+    c = ColorFiltered(
+      colorFilter: const ColorFilter.matrix(<double>[
+        1.35, 0, 0, 0, -22, //
+        0, 1.35, 0, 0, -22, //
+        0, 0, 1.35, 0, -22, //
+        0, 0, 0, 1, 0,
+      ]),
+      child: c,
+    );
+  }
+  return _UiScope(
+    rev: kUiRev.value,
+    child: Directionality(
+      textDirection: kRtl ? TextDirection.rtl : TextDirection.ltr,
+      child: MediaQuery(
+        data: mq.copyWith(textScaler: TextScaler.linear(kFontScale)),
+        child: c,
+      ),
+    ),
+  );
+}
+
+// ───────────────── App lock (Face ID / fingerprint on iPhone, code elsewhere) ─────────────────
+class LockGate extends StatefulWidget {
+  const LockGate({super.key, required this.child});
+  final Widget child;
+  @override
+  State<LockGate> createState() => _LockGateState();
+}
+
+class _LockGateState extends State<LockGate> with WidgetsBindingObserver {
+  bool _on = false;
+  bool _locked = false;
+  bool _checking = false;
+  String _pin = '';
+  String _entry = '';
+  DateTime? _bg;
+  bool _bad = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _load(true);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  Future<void> _load(bool cold) async {
+    final s = await loadSettings();
+    _on = s['appLock'] == true;
+    _pin = '${s['appLockPin'] ?? ''}';
+    if (_on && cold && mounted) {
+      setState(() => _locked = true);
+      _auth();
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState st) {
+    if (st == AppLifecycleState.paused) {
+      _bg = DateTime.now();
+    } else if (st == AppLifecycleState.resumed) {
+      final b = _bg;
+      _bg = null;
+      _load(false).then((_) {
+        if (_on &&
+            b != null &&
+            DateTime.now().difference(b).inSeconds > 30 &&
+            !CameraPage.active &&
+            mounted) {
+          setState(() {
+            _locked = true;
+            _entry = '';
+          });
+          _auth();
+        }
+      });
+    }
+  }
+
+  Future<void> _auth() async {
+    if (_checking || !_locked || !Platform.isIOS) return;
+    _checking = true;
+    try {
+      final la = LocalAuthentication();
+      if (await la.isDeviceSupported()) {
+        final ok = await la.authenticate(
+          localizedReason: tr('افتح LAN Cam'),
+          options: const AuthenticationOptions(stickyAuth: true),
+        );
+        if (ok && mounted) setState(() => _locked = false);
+      } else if (_pin.isEmpty && mounted) {
+        setState(() => _locked = false); // nothing to unlock with
+      }
+    } catch (_) {
+    } finally {
+      _checking = false;
+    }
+  }
+
+  void _key(String k) {
+    if (k.length != 1 || '0123456789'.indexOf(k) < 0) return;
+    setState(() {
+      _bad = false;
+      _entry += k;
+      if (_entry.length >= _pin.length) {
+        if (_entry == _pin) {
+          _locked = false;
+          _entry = '';
+        } else {
+          _entry = '';
+          _bad = true;
+        }
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_locked || CameraPage.active) return widget.child;
+    return Stack(children: [
+      widget.child,
+      Positioned.fill(
+        child: Material(
+          color: kBg,
+          child: SafeArea(
+            child: Column(children: [
+              const Spacer(),
+              const LogoMark(size: 84),
+              const SizedBox(height: 16),
+              const Text('التطبيق مقفل',
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
+              const SizedBox(height: 18),
+              if (Platform.isIOS)
+                FilledButton.icon(
+                  icon: const Icon(Icons.lock_open_rounded),
+                  label: const Text('فتح بالبصمة أو الوجه'),
+                  onPressed: _auth,
+                ),
+              if (_pin.isNotEmpty) ...[
+                const SizedBox(height: 14),
+                Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                  for (var i = 0; i < _pin.length; i++)
+                    Container(
+                      width: 14,
+                      height: 14,
+                      margin: const EdgeInsets.symmetric(horizontal: 5),
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: i < _entry.length ? kAccent : Colors.white24,
+                      ),
+                    ),
+                ]),
+                if (_bad)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 8),
+                    child: Text('الرمز غير صحيح',
+                        style: TextStyle(color: kRed, fontSize: 12)),
+                  ),
+                const Spacer(),
+                Keypad(
+                  onKey: _key,
+                  onBack: () => setState(() {
+                    if (_entry.isNotEmpty) {
+                      _entry = _entry.substring(0, _entry.length - 1);
+                    }
+                  }),
+                ),
+              ] else
+                const Spacer(),
+            ]),
+          ),
+        ),
+      ),
+    ]);
+  }
+}
+
+/// Live microphone level of the camera (baby / sound monitoring).
+class LevelBar extends StatelessWidget {
+  const LevelBar({super.key, required this.level});
+  final ValueListenable<double> level;
+  @override
+  Widget build(BuildContext context) => ValueListenableBuilder<double>(
+        valueListenable: level,
+        builder: (_, v, __) {
+          final x = (v * 3).clamp(0.0, 1.0).toDouble();
+          return Container(
+            width: 120,
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+            decoration: BoxDecoration(
+              color: const Color(0x99000000),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Row(children: [
+              const Icon(Icons.graphic_eq_rounded, size: 13, color: Colors.white70),
+              const SizedBox(width: 5),
+              Expanded(
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(4),
+                  child: LinearProgressIndicator(
+                    value: x,
+                    minHeight: 6,
+                    backgroundColor: Colors.white12,
+                    color: x > 0.7 ? kRed : (x > 0.35 ? Colors.amber : kGreen),
+                  ),
+                ),
+              ),
+            ]),
+          );
+        },
+      );
+}
+
+
+
+// ───────────────── Help hub + illustrated guides ─────────────────
+class _GStep {
+  const _GStep(this.icon, this.badge, this.title, this.text, {this.action});
+  final IconData icon;
+  final IconData badge;
+  final String title;
+  final String text;
+  final String? action; // store | ip | web | diag
+}
+
+const Map<String, List<_GStep>> _kGuides = {
+  'تثبيت الكاميرا في مكانها': [
+    _GStep(Icons.location_on_rounded, Icons.arrow_upward_rounded,
+        'اختر المكان', 'اختر مكاناً مرتفعاً يرى المنطقة كلها، وبعيداً عن الضوء المباشر.'),
+    _GStep(Icons.phone_android_rounded, Icons.screen_rotation_rounded,
+        'ثبّت الهاتف', 'ثبّت الهاتف أفقياً بحامل أو شريط لاصق، وتأكد أن العدسة غير محجوبة.'),
+    _GStep(Icons.power_rounded, Icons.battery_charging_full_rounded,
+        'وصّل الشاحن', 'ابقِ الهاتف على الشاحن، وفعّل "جاهزية دائمة" و"بدء الكاميرا عند الشحن".'),
+    _GStep(Icons.wifi_rounded, Icons.signal_wifi_4_bar_rounded,
+        'تأكد من الإشارة', 'قوة الواي فاي في المكان مهمة. جرّب البث وراقب مؤشر "اتصال قوي".'),
+  ],
+  'ضبط مناطق الكشف': [
+    _GStep(Icons.security_rounded, Icons.touch_app_rounded,
+        'افتح الأمان', 'من شاشة المشاهدة اضغط "الأمان" ثم "تحديد مناطق الكشف".'),
+    _GStep(Icons.grid_on_rounded, Icons.brush_rounded,
+        'لوّن الخانات', 'مرّر إصبعك على الخانات التي تريد تجاهلها، مثل شجرة تتحرك أو شارع.'),
+    _GStep(Icons.visibility_off_rounded, Icons.visibility_rounded,
+        'اختر الوضع', 'اختر "تجاهل المناطق" أو "مراقبة المناطق فقط" حسب حاجتك.'),
+    _GStep(Icons.check_circle_rounded, Icons.done_all_rounded,
+        'احفظ', 'اضغط "تم". جرّب بتحريك يدك أمام الكاميرا للتأكد.'),
+  ],
+  'فتح الأذونات': [
+    _GStep(Icons.photo_camera_rounded, Icons.mic_rounded,
+        'الكاميرا والميكروفون', 'اضغط "السماح" عند الطلب، وهما ضروريان للبث والصوت.'),
+    _GStep(Icons.battery_saver_rounded, Icons.check_rounded,
+        'استثناء البطارية', 'يمنع النظام من إغلاق التطبيق وهو يعمل في الخلفية.'),
+    _GStep(Icons.layers_rounded, Icons.check_rounded,
+        'الظهور فوق التطبيقات', 'يلزم لإيقاظ الكاميرا وهي مغلقة.'),
+    _GStep(Icons.accessibility_new_rounded, Icons.touch_app_rounded,
+        'إمكانية الوصول (اختياري)', 'للتحكم بشاشة الهاتف عن بعد. افتح فحص المشاكل لمتابعة الخطوات.',
+        action: 'diag'),
+  ],
+  'المشاهدة من خارج البيت': [
+    _GStep(Icons.download_rounded, Icons.apps_rounded,
+        'ثبّت Tailscale', 'ثبّت تطبيق Tailscale المجاني على هاتف الكاميرا وهاتف المشاهد.',
+        action: 'store'),
+    _GStep(Icons.login_rounded, Icons.person_rounded,
+        'سجّل بنفس الحساب', 'سجّل الدخول في التطبيقين بنفس الحساب، وفعّل الاتصال (VPN).'),
+    _GStep(Icons.dns_rounded, Icons.numbers_rounded,
+        'اعرف عنوان الكاميرا', 'على هاتف الكاميرا يظهر عنوان يبدأ بـ 100. بجانب كلمة VPN. استخدمه بدل عنوان الواي فاي.',
+        action: 'ip'),
+    _GStep(Icons.public_rounded, Icons.check_circle_rounded,
+        'جرّب الاتصال', 'اكتب ذلك العنوان في المشاهد أو في "اختبار الاتصال". لا تفتح منافذ الراوتر.',
+        action: 'diag'),
+  ],
+  'المشاهدة من المتصفح': [
+    _GStep(Icons.language_rounded, Icons.link_rounded,
+        'افتح الرابط', 'على أي جهاز على نفس الشبكة افتح الرابط المعروض على هاتف الكاميرا (ينتهي بـ /web).',
+        action: 'web'),
+    _GStep(Icons.shield_rounded, Icons.warning_amber_rounded,
+        'اقبل التحذير', 'قد يعرض المتصفح تحذير شهادة لأن الاتصال محلي. اختر المتابعة.'),
+    _GStep(Icons.pin_rounded, Icons.visibility_rounded,
+        'اكتب الرمز', 'اكتب رمز المشاهدة فقط لتعرض البث بلا تحكم.'),
+  ],
+};
+
+class HelpHubPage extends StatelessWidget {
+  const HelpHubPage({super.key});
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('ساعدني')),
+        body: ListView(padding: const EdgeInsets.all(14), children: [
+          ListTile(
+            tileColor: kSurface,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            leading: const Icon(Icons.health_and_safety_rounded, color: kAccent),
+            title: const Text('لماذا لا يعمل؟'),
+            subtitle: const Text('فحص سريع مع أزرار إصلاح',
+                style: TextStyle(fontSize: 12, color: Colors.white54)),
+            onTap: () => Navigator.push(context,
+                MaterialPageRoute(builder: (_) => const DiagPage())),
+          ),
+          const SizedBox(height: 10),
+          ListTile(
+            tileColor: kSurface,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            leading: const Icon(Icons.rocket_launch_rounded, color: kAccent),
+            title: const Text('الإعداد السريع'),
+            onTap: () => Navigator.push(context,
+                MaterialPageRoute(builder: (_) => const SetupWizard())),
+          ),
+          const SizedBox(height: 14),
+          const Text('أدلة مصورة',
+              style: TextStyle(fontWeight: FontWeight.w800, color: Colors.white70)),
+          const SizedBox(height: 8),
+          for (final k in _kGuides.keys)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: ListTile(
+                tileColor: kSurface,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16)),
+                leading: const Icon(Icons.play_circle_outline_rounded,
+                    color: Color(0xFFFBBF24)),
+                title: Text(k),
+                trailing: const Icon(Icons.chevron_left_rounded),
+                onTap: () => Navigator.push(context,
+                    MaterialPageRoute(builder: (_) => GuidePage(name: k))),
+              ),
+            ),
+        ]),
+      );
+}
+
+class GuidePage extends StatefulWidget {
+  const GuidePage({super.key, required this.name});
+  final String name;
+  @override
+  State<GuidePage> createState() => _GuidePageState();
+}
+
+class _GuidePageState extends State<GuidePage> {
+  final _pc = PageController();
+  int _i = 0;
+  String _tsIp = '';
+
+  @override
+  void initState() {
+    super.initState();
+    allIps().then((l) {
+      for (final e in l) {
+        if (e.value.startsWith('100.')) {
+          if (mounted) setState(() => _tsIp = e.value);
+        }
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _pc.dispose();
+    super.dispose();
+  }
+
+  Future<void> _open(String url) async {
+    try {
+      await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+    } catch (_) {}
+  }
+
+  Widget _action(_GStep st) {
+    switch (st.action) {
+      case 'store':
+        return Wrap(spacing: 8, children: [
+          FilledButton.tonal(
+              onPressed: () =>
+                  _open('https://apps.apple.com/app/tailscale/id1470499037'),
+              child: const Text('App Store')),
+          FilledButton.tonal(
+              onPressed: () => _open(
+                  'https://play.google.com/store/apps/details?id=com.tailscale.ipn'),
+              child: const Text('Google Play')),
+        ]);
+      case 'ip':
+        return Text(
+            _tsIp.isEmpty
+                ? 'لم يُكتشف Tailscale على هذا الهاتف بعد'
+                : 'عنوان Tailscale لهذا الهاتف: $_tsIp',
+            textDirection: TextDirection.ltr,
+            style: TextStyle(color: _tsIp.isEmpty ? Colors.white54 : kGreen));
+      case 'diag':
+        return FilledButton.tonal(
+            onPressed: () => Navigator.push(context,
+                MaterialPageRoute(builder: (_) => const DiagPage())),
+            child: const Text('لماذا لا يعمل؟'));
+      case 'web':
+        return Text('${kTls ? 'https' : 'http'}://عنوان-الكاميرا:$kPort/web',
+            textDirection: TextDirection.ltr,
+            style: const TextStyle(color: kAccent));
+      default:
+        return const SizedBox.shrink();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final steps = _kGuides[widget.name] ?? const <_GStep>[];
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.name)),
+      body: SafeArea(
+        child: Column(children: [
+          Expanded(
+            child: PageView.builder(
+              controller: _pc,
+              itemCount: steps.length,
+              onPageChanged: (v) => setState(() => _i = v),
+              itemBuilder: (_, i) {
+                final st = steps[i];
+                return Padding(
+                  padding: const EdgeInsets.all(22),
+                  child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    TweenAnimationBuilder<double>(
+                      key: ValueKey('g$i'),
+                      tween: Tween(begin: 0.85, end: 1.0),
+                      duration: const Duration(milliseconds: 700),
+                      curve: Curves.elasticOut,
+                      builder: (_, v, child) =>
+                          Transform.scale(scale: v, child: child),
+                      child: SizedBox(
+                        width: 190,
+                        height: 190,
+                        child: Stack(alignment: Alignment.center, children: [
+                          Container(
+                            decoration: const BoxDecoration(
+                                color: Color(0x2622D3EE), shape: BoxShape.circle),
+                          ),
+                          Icon(st.icon, size: 92, color: kAccent),
+                          Positioned(
+                            right: 22,
+                            bottom: 22,
+                            child: Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: const BoxDecoration(
+                                  color: kSurface2, shape: BoxShape.circle),
+                              child: Icon(st.badge,
+                                  size: 28, color: const Color(0xFFFBBF24)),
+                            ),
+                          ),
+                        ]),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                    Text(st.title,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                            fontSize: 22, fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 10),
+                    Text(st.text,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                            fontSize: 15, color: Colors.white70, height: 1.7)),
+                    const SizedBox(height: 16),
+                    _action(st),
+                  ]),
+                );
+              },
+            ),
+          ),
+          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            for (var i = 0; i < steps.length; i++)
+              Container(
+                width: i == _i ? 22 : 8,
+                height: 8,
+                margin: const EdgeInsets.symmetric(horizontal: 3),
+                decoration: BoxDecoration(
+                  color: i == _i ? kAccent : Colors.white24,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+              ),
+          ]),
+          Padding(
+            padding: const EdgeInsets.all(14),
+            child: Row(children: [
+              if (_i > 0)
+                TextButton(
+                    onPressed: () => _pc.previousPage(
+                        duration: const Duration(milliseconds: 250),
+                        curve: Curves.easeOut),
+                    child: const Text('السابق')),
+              const Spacer(),
+              FilledButton(
+                onPressed: () {
+                  if (_i + 1 >= steps.length) {
+                    Navigator.pop(context);
+                  } else {
+                    _pc.nextPage(
+                        duration: const Duration(milliseconds: 250),
+                        curve: Curves.easeOut);
+                  }
+                },
+                child: Text(_i + 1 >= steps.length ? 'تم' : 'التالي'),
+              ),
+            ]),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+// ───────────────── Access log (who watched, when) ─────────────────
+class AccessLogPage extends StatefulWidget {
+  const AccessLogPage({super.key, required this.ip, required this.pin});
+  final String ip;
+  final String pin;
+  @override
+  State<AccessLogPage> createState() => _AccessLogPageState();
+}
+
+class _AccessLogPageState extends State<AccessLogPage> {
+  List<Map<String, dynamic>> _l = [];
+  bool _loading = true;
+  String? _err;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final c = tlsClient()..connectionTimeout = const Duration(seconds: 5);
+    try {
+      final qp = {'pin': widget.pin};
+      final u = kTls
+          ? Uri.https('${widget.ip}:$kPort', '/lib/log', qp)
+          : Uri.http('${widget.ip}:$kPort', '/lib/log', qp);
+      final res = await (await c.getUrl(u)).close();
+      if (res.statusCode == 403) throw 'سجل الدخول لصاحب الرمز الأساسي فقط';
+      if (res.statusCode != 200) throw 'تعذّر جلب القائمة';
+      final body = await res.transform(utf8.decoder).join();
+      _l = (jsonDecode(body) as List)
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+      if (mounted) setState(() => _loading = false);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _err = e is String ? e : 'تعذّر الاتصال بالكاميرا';
+        });
+      }
+    } finally {
+      c.close(force: true);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('سجل الدخول')),
+        body: _loading
+            ? const Center(child: CircularProgressIndicator())
+            : _err != null
+                ? Center(child: Text(_err!))
+                : _l.isEmpty
+                    ? const Center(child: Text('لا توجد أحداث بعد'))
+                    : ListView(padding: const EdgeInsets.all(12), children: [
+                        for (final e in _l)
+                          Container(
+                            margin: const EdgeInsets.only(bottom: 8),
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: kSurface,
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                            child: Row(children: [
+                              Icon(
+                                  e['role'] == 'admin'
+                                      ? Icons.admin_panel_settings_rounded
+                                      : Icons.visibility_rounded,
+                                  color: e['role'] == 'admin' ? kAccent : Colors.white54),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                          fmtStamp(DateTime.fromMillisecondsSinceEpoch(
+                                              (e['t'] as num).toInt())),
+                                          textDirection: TextDirection.ltr,
+                                          style: const TextStyle(
+                                              fontWeight: FontWeight.w700)),
+                                      Text('${e['ip']}',
+                                          textDirection: TextDirection.ltr,
+                                          style: const TextStyle(
+                                              fontSize: 12, color: Colors.white54)),
+                                    ]),
+                              ),
+                              Text(e['role'] == 'admin' ? 'تحكم كامل' : 'مشاهدة فقط',
+                                  style: const TextStyle(fontSize: 12)),
+                            ]),
+                          ),
+                      ]),
+      );
+}
+
+/// Scans a pairing QR, saves the camera in the list, returns its data.
+Future<Map<String, dynamic>?> addCamFromQr(BuildContext context) async {
+  final v = await Navigator.push<String>(
+      context, MaterialPageRoute(builder: (_) => const QrScanPage()));
+  if (v == null) return null;
+  final p = v.split('|');
+  if (p.length < 4) return null;
+  final s = await loadSettings();
+  final l = <Map<String, dynamic>>[
+    for (final c in ((s['cams'] as List?) ?? const []))
+      Map<String, dynamic>.from(c as Map),
+  ];
+  final existing = l.indexWhere((c) => c['ip'] == p[1]);
+  final cam = <String, dynamic>{
+    'name': existing >= 0 ? l[existing]['name'] : 'كاميرا ${l.length + 1}',
+    'ip': p[1],
+    'pin': p[3],
+    'color': existing >= 0
+        ? l[existing]['color']
+        : kCamColors[l.length % kCamColors.length],
+  };
+  if (existing >= 0) {
+    l[existing] = cam;
+  } else if (l.length < 4) {
+    l.add(cam);
+  }
+  await saveSettings({'cams': l, 'ip': p[1], 'pin': p[3]});
+  refreshShortcuts();
+  return cam;
+}
+
+/// Browser viewer served by the camera at /web (no app needed).
+const String kWebPage = r'''<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LAN Cam</title>
+<style>
+body{margin:0;background:#0b1220;color:#e6edf3;font:16px system-ui,sans-serif;text-align:center}
+#login{padding:60px 20px}
+input{font-size:22px;padding:12px;border-radius:12px;border:0;width:170px;text-align:center;letter-spacing:6px}
+button{font-size:16px;padding:12px 20px;border-radius:12px;border:0;background:#22d3ee;color:#04202a;margin:6px;cursor:pointer}
+video{width:100%;max-height:82vh;background:#000}
+#st{font-size:12px;color:#9aa4b2;padding:6px}
+</style></head><body>
+<div id="login">
+<h2>LAN Cam</h2>
+<p id="t1"></p>
+<input id="pin" inputmode="numeric" maxlength="6" placeholder="PIN"><br><br>
+<button id="go"></button>
+<p id="msg" style="color:#fbbf24"></p>
+</div>
+<div id="view" hidden>
+<video id="v" autoplay playsinline muted></video>
+<div>
+<button id="mu"></button><button id="fs"></button><button id="sn"></button>
+</div>
+<div id="st"></div>
+</div>
+<script>
+var ar=(navigator.language||'en').indexOf('ar')===0;
+var L=ar?{t1:'اكتب رمز المشاهدة',go:'مشاهدة',mu:'الصوت',fs:'ملء الشاشة',sn:'لقطة',bad:'PIN غير صحيح',lock:'محاولات كثيرة، انتظر',conn:'جاري الاتصال...',lost:'انقطع الاتصال، إعادة المحاولة...'}
+:{t1:'Enter the viewing code',go:'Watch',mu:'Sound',fs:'Fullscreen',sn:'Snapshot',bad:'Wrong PIN',lock:'Too many attempts, wait',conn:'Connecting...',lost:'Disconnected, retrying...'};
+if(ar)document.documentElement.dir='rtl';
+function $(i){return document.getElementById(i)}
+$('t1').textContent=L.t1;$('go').textContent=L.go;$('mu').textContent=L.mu;$('fs').textContent=L.fs;$('sn').textContent=L.sn;
+var pc=null,ws=null,live=false,pin='',stop=false;
+$('go').onclick=function(){pin=$('pin').value.trim();if(pin){stop=false;start();}};
+$('mu').onclick=function(){$('v').muted=!$('v').muted;};
+$('fs').onclick=function(){var v=$('v');(v.requestFullscreen||v.webkitEnterFullscreen||function(){}).call(v);};
+$('sn').onclick=function(){var v=$('v'),c=document.createElement('canvas');c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);var a=document.createElement('a');a.href=c.toDataURL('image/png');a.download='lancam.png';a.click();};
+function retry(){if(stop)return;live=false;$('st').textContent=L.lost;setTimeout(start,3000);}
+async function start(){
+ try{if(ws)ws.close();if(pc)pc.close();}catch(e){}
+ $('msg').textContent=L.conn;
+ ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host);
+ pc=new RTCPeerConnection({iceServers:[]});
+ pc.addTransceiver('video',{direction:'recvonly'});
+ pc.addTransceiver('audio',{direction:'recvonly'});
+ pc.ontrack=function(e){if(e.track.kind==='video'){$('v').srcObject=e.streams[0];$('login').hidden=true;$('view').hidden=false;}};
+ pc.onconnectionstatechange=function(){var s=pc.connectionState;if(s==='connected'){live=true;$('st').textContent='LIVE';}else if(s==='failed'||s==='disconnected'||s==='closed'){retry();}};
+ ws.onmessage=async function(m){
+  var d=JSON.parse(m.data);
+  if(d.type==='answer'){await pc.setRemoteDescription({type:'answer',sdp:d.sdp});}
+  else if(d.type==='denied'){stop=true;$('login').hidden=false;$('view').hidden=true;$('msg').textContent=L.bad;ws.close();}
+  else if(d.type==='locked'){stop=true;$('login').hidden=false;$('view').hidden=true;$('msg').textContent=L.lock;ws.close();}
+  else if(d.type==='health'&&live){var b=d.bat!=null?(' | '+d.bat+'%'+(d.chg?' ⚡':'')):'';$('st').textContent='LIVE'+b;}
+ };
+ ws.onclose=function(){if(!stop&&live)retry();};
+ await new Promise(function(r){ws.onopen=r;});
+ var offer=await pc.createOffer();await pc.setLocalDescription(offer);
+ await new Promise(function(r){if(pc.iceGatheringState==='complete')r();else{pc.onicegatheringstatechange=function(){if(pc.iceGatheringState==='complete')r();};setTimeout(r,3000);}});
+ ws.send(JSON.stringify({type:'offer',sdp:pc.localDescription.sdp,pin:pin}));
+}
+</script></body></html>''';
+
+const Map<String, List<String>> kTr = {
+  'الشبكة المحلية (واي فاي)': ['Local network (Wi‑Fi)', 'Réseau local (Wi‑Fi)', 'Yerel ağ (Wi‑Fi)', 'مقامی نیٹ ورک (وائی فائی)'],
+  'غير متصل بشبكة. اتصل بالواي فاي نفسه على الهاتفين.': ['Not connected. Join the same Wi‑Fi on both phones.', 'Non connecté. Rejoignez le même Wi‑Fi sur les deux téléphones.', 'Bağlı değil. İki telefonda da aynı Wi‑Fi\'a bağlanın.', 'نیٹ ورک سے منسلک نہیں۔ دونوں فونز پر ایک ہی وائی فائی سے جڑیں۔'],
+  'إذن الكاميرا': ['Camera permission', 'Autorisation de la caméra', 'Kamera izni', 'کیمرے کی اجازت'],
+  'مسموح': ['Allowed', 'Autorisé', 'İzin verildi', 'اجازت ہے'],
+  'غير مسموح (مطلوب لجهاز الكاميرا)': ['Not allowed (needed on the camera phone)', 'Refusé (requis sur le téléphone caméra)', 'İzin yok (kamera telefonunda gerekli)', 'اجازت نہیں (کیمرہ فون پر ضروری)'],
+  'السماح': ['Allow', 'Autoriser', 'İzin ver', 'اجازت دیں'],
+  'إذن الميكروفون': ['Microphone permission', 'Autorisation du micro', 'Mikrofon izni', 'مائیکروفون کی اجازت'],
+  'غير مسموح (الصوت لن يعمل)': ['Not allowed (no sound)', 'Refusé (pas de son)', 'İzin yok (ses çalışmaz)', 'اجازت نہیں (آواز نہیں آئے گی)'],
+  'الخدمة في الخلفية': ['Background service', 'Service en arrière-plan', 'Arka plan hizmeti', 'بیک گراؤنڈ سروس'],
+  'تعمل': ['Running', 'En cours', 'Çalışıyor', 'چل رہی ہے'],
+  'متوقفة. فعّل "جاهزية دائمة" في وضع الكاميرا.': ['Stopped. Turn on "Always ready" in camera mode.', 'Arrêté. Activez « Toujours prêt » en mode caméra.', 'Durdu. Kamera modunda "Her zaman hazır"ı açın.', 'بند ہے۔ کیمرہ موڈ میں "ہمیشہ تیار" آن کریں۔'],
+  'يستمع': ['Listening', 'À l\'écoute', 'Dinliyor', 'سن رہا ہے'],
+  'لا يستمع (الجاهزية الدائمة مطفأة)': ['Not listening (Always ready is off)', 'Pas d\'écoute (Toujours prêt désactivé)', 'Dinlemiyor (Her zaman hazır kapalı)', 'نہیں سن رہا (ہمیشہ تیار بند ہے)'],
+  'استثناء توفير البطارية': ['Battery optimisation exemption', 'Exemption d\'économie de batterie', 'Pil tasarrufu muafiyeti', 'بیٹری سیور سے استثنا'],
+  'مستثنى': ['Exempt', 'Exempté', 'Muaf', 'مستثنیٰ'],
+  'النظام قد يقتل التطبيق في الخلفية': ['The system may close the app in the background', 'Le système peut fermer l\'app en arrière-plan', 'Sistem uygulamayı arka planda kapatabilir', 'سسٹم ایپ کو بیک گراؤنڈ میں بند کر سکتا ہے'],
+  'استثناء': ['Exempt', 'Exempter', 'Muaf tut', 'استثنا دیں'],
+  'الظهور فوق التطبيقات': ['Display over other apps', 'Affichage par-dessus les autres apps', 'Diğer uygulamaların üzerinde göster', 'دوسری ایپس کے اوپر دکھائیں'],
+  'مطلوب لإيقاظ الكاميرا وهي مغلقة': ['Needed to wake the camera when it is closed', 'Nécessaire pour réveiller la caméra fermée', 'Kapalıyken kamerayı uyandırmak için gerekli', 'بند کیمرے کو جگانے کے لیے ضروری'],
+  'التحكم في الشاشة (إمكانية الوصول)': ['Screen control (Accessibility)', 'Contrôle de l\'écran (Accessibilité)', 'Ekran kontrolü (Erişilebilirlik)', 'اسکرین کنٹرول (ایکسیسبیلٹی)'],
+  'مفعّل': ['On', 'Activé', 'Açık', 'فعال'],
+  'فتح': ['Open', 'Ouvrir', 'Aç', 'کھولیں'],
+  'تشفير TLS': ['TLS encryption', 'Chiffrement TLS', 'TLS şifreleme', 'TLS خفیہ کاری'],
+  'غير مضمّن في هذا الإصدار (الاتصال غير مشفّر)': ['Not included in this version (connection is not encrypted)', 'Non inclus dans cette version (connexion non chiffrée)', 'Bu sürümde yok (bağlantı şifresiz)', 'اس ورژن میں شامل نہیں (کنکشن غیر خفیہ ہے)'],
+  'إشعارات خارجية (تيليغرام / ntfy)': ['External notifications (Telegram / ntfy)', 'Notifications externes (Telegram / ntfy)', 'Harici bildirimler (Telegram / ntfy)', 'بیرونی اطلاعات (ٹیلیگرام / ntfy)'],
+  'مُعدّة والإنترنت متاح': ['Set up and internet is available', 'Configuré et Internet disponible', 'Kurulu ve internet var', 'ترتیب شدہ اور انٹرنیٹ دستیاب'],
+  'مُعدّة لكن لا يوجد إنترنت الآن': ['Set up but no internet right now', 'Configuré mais pas d\'Internet', 'Kurulu ama şu an internet yok', 'ترتیب شدہ مگر ابھی انٹرنیٹ نہیں'],
+  'غير مُعدّة (الإعدادات ← إشعارات خارجية)': ['Not set up (Settings → External notifications)', 'Non configuré (Réglages → Notifications externes)', 'Kurulu değil (Ayarlar → Harici bildirimler)', 'ترتیب نہیں دی گئی (سیٹنگز ← بیرونی اطلاعات)'],
+  'الكاميرا تعمل وتستقبل': ['The camera is running and receiving', 'La caméra fonctionne et reçoit', 'Kamera çalışıyor ve bağlantı kabul ediyor', 'کیمرہ چل رہا ہے اور کنکشن لے رہا ہے'],
+  'لا يوجد رد: الكاميرا مغلقة أو العنوان خطأ أو شبكة مختلفة': ['No reply: camera is off, wrong address, or a different network', 'Pas de réponse : caméra éteinte, mauvaise adresse ou autre réseau', 'Yanıt yok: kamera kapalı, adres yanlış veya farklı ağ', 'کوئی جواب نہیں: کیمرہ بند، غلط ایڈریس یا مختلف نیٹ ورک'],
+  'الجاهزية الدائمة تعمل (يمكن إيقاظها)': ['Always ready is working (it can be woken)', 'Toujours prêt actif (peut être réveillée)', 'Her zaman hazır çalışıyor (uyandırılabilir)', 'ہمیشہ تیار فعال ہے (جگایا جا سکتا ہے)'],
+  'غير مفعّل (غير مطلوب والكاميرا شغّالة)': ['Off (not needed, the camera is running)', 'Désactivé (inutile, la caméra tourne)', 'Kapalı (gerekmez, kamera çalışıyor)', 'بند (ضرورت نہیں، کیمرہ چل رہا ہے)'],
+  'الجاهزية الدائمة غير مفعّلة على الكاميرا': ['Always ready is off on the camera', 'Toujours prêt désactivé sur la caméra', 'Kamerada Her zaman hazır kapalı', 'کیمرے پر ہمیشہ تیار بند ہے'],
+  'إصلاح': ['Fix', 'Réparer', 'Düzelt', 'ٹھیک کریں'],
+  'لماذا لا يعمل؟': ['Why isn\'t it working?', 'Pourquoi ça ne marche pas ?', 'Neden çalışmıyor?', 'یہ کیوں کام نہیں کر رہا؟'],
+  'هذا الهاتف': ['This phone', 'Ce téléphone', 'Bu telefon', 'یہ فون'],
+  'اختبار الاتصال بكاميرا': ['Test connection to a camera', 'Tester la connexion à une caméra', 'Bir kameraya bağlantıyı test et', 'کیمرے سے کنکشن کا ٹیسٹ'],
+  'IP الكاميرا': ['Camera IP', 'IP de la caméra', 'Kamera IP', 'کیمرے کا IP'],
+  'فحص': ['Check', 'Tester', 'Kontrol', 'جانچیں'],
+  'ما دور هذا الهاتف؟': ['What is this phone\'s role?', 'Quel est le rôle de ce téléphone ?', 'Bu telefonun rolü nedir?', 'اس فون کا کردار کیا ہے؟'],
+  'كاميرا': ['Camera', 'Caméra', 'Kamera', 'کیمرہ'],
+  'يبقى في مكانه ويبث': ['Stays in place and streams', 'Reste en place et diffuse', 'Yerinde durur ve yayın yapar', 'اپنی جگہ رہ کر نشر کرتا ہے'],
+  'مشاهد': ['Viewer', 'Spectateur', 'İzleyici', 'ناظر'],
+  'أشاهد به الكاميرا وأتحكم': ['Watch the camera and control it', 'Regarder la caméra et la contrôler', 'Kamerayı izle ve kontrol et', 'کیمرہ دیکھیں اور کنٹرول کریں'],
+  'الأذونات': ['Permissions', 'Autorisations', 'İzinler', 'اجازتیں'],
+  'الكاميرا': ['Camera', 'Caméra', 'Kamera', 'کیمرہ'],
+  'الميكروفون': ['Microphone', 'Micro', 'Mikrofon', 'مائیکروفون'],
+  'العمل في الخلفية': ['Background operation', 'Fonctionnement en arrière-plan', 'Arka planda çalışma', 'بیک گراؤنڈ میں کام'],
+  'كي تبقى الكاميرا تعمل وتُوقَظ وهي مغلقة': ['So the camera keeps running and can be woken when closed', 'Pour que la caméra reste active et puisse être réveillée', 'Kameranın çalışmaya devam etmesi ve kapalıyken uyandırılabilmesi için', 'تاکہ کیمرہ چلتا رہے اور بند ہونے پر جگایا جا سکے'],
+  'التحكم في الشاشة (اختياري)': ['Screen control (optional)', 'Contrôle de l\'écran (facultatif)', 'Ekran kontrolü (isteğe bağlı)', 'اسکرین کنٹرول (اختیاری)'],
+  'إشعارات وأنت بعيد (اختياري)': ['Alerts when you\'re away (optional)', 'Alertes à distance (facultatif)', 'Uzaktayken bildirimler (isteğe bağlı)', 'دور ہونے پر اطلاعات (اختیاری)'],
+  'إعداد الإشعارات': ['Set up alerts', 'Configurer les alertes', 'Bildirimleri kur', 'اطلاعات ترتیب دیں'],
+  'اربط جهاز المشاهدة': ['Pair the viewer device', 'Associer l\'appareil spectateur', 'İzleyici cihazı eşleştir', 'ناظر ڈیوائس جوڑیں'],
+  'تأكد أنك متصل بالواي فاي': ['Make sure you\'re on Wi‑Fi', 'Vérifiez que vous êtes en Wi‑Fi', 'Wi‑Fi\'a bağlı olduğunuzdan emin olun', 'یقینی بنائیں کہ آپ وائی فائی پر ہیں'],
+  'على هاتف المشاهد: اختر "مشاهد" ثم امسح هذا الرمز.': ['On the viewer phone: choose "Viewer", then scan this code.', 'Sur le téléphone spectateur : choisissez « Spectateur » puis scannez ce code.', 'İzleyici telefonda "İzleyici"yi seçip bu kodu tarayın.', 'ناظر فون پر "ناظر" چنیں پھر یہ کوڈ اسکین کریں۔'],
+  'اربط الكاميرا': ['Pair the camera', 'Associer la caméra', 'Kamerayı eşleştir', 'کیمرہ جوڑیں'],
+  'على هاتف الكاميرا افتح "وضع الكاميرا" ثم "عرض رمز QR للربط"، وامسحه هنا.': ['On the camera phone open "Camera mode", then "Show QR code to pair", and scan it here.', 'Sur le téléphone caméra, ouvrez « Mode caméra » puis « Afficher le code QR », et scannez-le ici.', 'Kamera telefonunda "Kamera modu"nu, sonra "QR kodunu göster"i açıp burada tarayın.', 'کیمرہ فون پر "کیمرہ موڈ" پھر "جوڑنے کا QR کوڈ دکھائیں" کھولیں اور یہاں اسکین کریں۔'],
+  'مسح الرمز': ['Scan code', 'Scanner le code', 'Kodu tara', 'کوڈ اسکین کریں'],
+  'الإعداد السريع': ['Quick setup', 'Configuration rapide', 'Hızlı kurulum', 'فوری سیٹ اپ'],
+  'تخطي': ['Skip', 'Passer', 'Atla', 'چھوڑیں'],
+  'السابق': ['Back', 'Précédent', 'Geri', 'پچھلا'],
+  'تم': ['Done', 'Terminé', 'Tamam', 'ہو گیا'],
+  'التالي': ['Next', 'Suivant', 'İleri', 'اگلا'],
+  'عالية': ['High', 'Élevée', 'Yüksek', 'اعلیٰ'],
+  'جيدة': ['Good', 'Bonne', 'İyi', 'اچھی'],
+  'متوسطة': ['Medium', 'Moyenne', 'Orta', 'درمیانی'],
+  'منخفضة': ['Low', 'Faible', 'Düşük', 'کم'],
+  'دنيا': ['Lowest', 'Minimale', 'En düşük', 'کم ترین'],
+  'اتصال قوي': ['Strong link', 'Lien fort', 'Güçlü bağlantı', 'مضبوط کنکشن'],
+  'متوسط': ['Medium', 'Moyen', 'Orta', 'درمیانی'],
+  'ضعيف': ['Weak', 'Faible', 'Zayıf', 'کمزور'],
+  'امسح رمز QR من شاشة الكاميرا': ['Scan the QR code from the camera screen', 'Scannez le code QR de l\'écran de la caméra', 'Kamera ekranındaki QR kodunu tarayın', 'کیمرے کی اسکرین سے QR کوڈ اسکین کریں'],
+  'على جهاز الكاميرا اضغط "عرض رمز QR"': ['On the camera device tap "Show QR code"', 'Sur la caméra, touchez « Afficher le code QR »', 'Kamera cihazında "QR kodunu göster"e dokunun', 'کیمرہ ڈیوائس پر "QR کوڈ دکھائیں" دبائیں'],
+  'تم النسخ': ['Copied', 'Copié', 'Kopyalandı', 'کاپی ہو گیا'],
+  'مراقبة خاصة عبر شبكتك المحلية': ['Private monitoring over your local network', 'Surveillance privée sur votre réseau local', 'Yerel ağınız üzerinden özel izleme', 'آپ کے مقامی نیٹ ورک پر نجی نگرانی'],
+  'وضع الكاميرا': ['Camera mode', 'Mode caméra', 'Kamera modu', 'کیمرہ موڈ'],
+  'حوّل هذا الهاتف إلى كاميرا مراقبة': ['Turn this phone into a security camera', 'Transformez ce téléphone en caméra de surveillance', 'Bu telefonu güvenlik kamerasına çevirin', 'اس فون کو نگرانی کیمرہ بنائیں'],
+  'وضع المشاهدة': ['Viewer mode', 'Mode spectateur', 'İzleyici modu', 'ناظر موڈ'],
+  'شاهد البث واتحكم بالكاميرا عن بعد': ['Watch the stream and control the camera remotely', 'Regardez le flux et contrôlez la caméra à distance', 'Yayını izleyin, kamerayı uzaktan kontrol edin', 'سٹریم دیکھیں اور کیمرہ دور سے کنٹرول کریں'],
+  'عدة كاميرات': ['Multiple cameras', 'Plusieurs caméras', 'Birden çok kamera', 'متعدد کیمرے'],
+  'شاهد حتى 4 كاميرات معاً في شبكة 2×2': ['Watch up to 4 cameras together in a 2×2 grid', 'Jusqu\'à 4 caméras ensemble en grille 2×2', '2×2 ızgarada 4 kameraya kadar birlikte izleyin', '2×2 گرڈ میں 4 کیمرے تک ایک ساتھ دیکھیں'],
+  'شاشة الهاتف': ['Phone screen', 'Écran du téléphone', 'Telefon ekranı', 'فون اسکرین'],
+  'اعرض شاشة هاتف آخر وتحكم به عن بعد': ['Show another phone\'s screen and control it remotely', 'Affichez l\'écran d\'un autre téléphone et contrôlez-le', 'Başka bir telefonun ekranını gösterin ve uzaktan kontrol edin', 'دوسرے فون کی اسکرین دیکھیں اور دور سے کنٹرول کریں'],
+  'إعدادات البث': ['Stream settings', 'Réglages du flux', 'Yayın ayarları', 'سٹریم سیٹنگز'],
+  'الدقة، الإطارات، معدل البيانات وغيرها': ['Resolution, frame rate, bitrate and more', 'Résolution, images/s, débit et plus', 'Çözünürlük, kare hızı, bit hızı ve daha fazlası', 'ریزولوشن، فریم ریٹ، بٹ ریٹ اور مزید'],
+  'بث مباشر': ['Live stream', 'Flux en direct', 'Canlı yayın', 'لائیو سٹریم'],
+  'صوت ثنائي الاتجاه': ['Two‑way audio', 'Audio bidirectionnel', 'Çift yönlü ses', 'دو طرفہ آواز'],
+  'تسجيل': ['Record', 'Enregistrer', 'Kayıt', 'ریکارڈ'],
+  'رمز حماية PIN': ['PIN protection', 'Protection par PIN', 'PIN koruması', 'PIN تحفظ'],
+  'ربط QR': ['QR pairing', 'Association QR', 'QR eşleştirme', 'QR جوڑنا'],
+  'رؤية ليلية': ['Night view', 'Vision nocturne', 'Gece görüşü', 'رات کا منظر'],
+  'إعادة اتصال تلقائية': ['Auto reconnect', 'Reconnexion auto', 'Otomatik yeniden bağlanma', 'خودکار دوبارہ کنکشن'],
+  'البث (جهاز الكاميرا)': ['Streaming (camera device)', 'Diffusion (appareil caméra)', 'Yayın (kamera cihazı)', 'سٹریمنگ (کیمرہ ڈیوائس)'],
+  'الدقة': ['Resolution', 'Résolution', 'Çözünürlük', 'ریزولوشن'],
+  'الإطارات في الثانية (FPS)': ['Frames per second (FPS)', 'Images par seconde (FPS)', 'Saniyedeki kare (FPS)', 'فریم فی سیکنڈ (FPS)'],
+  'أقصى معدل بيانات': ['Maximum bitrate', 'Débit maximal', 'En yüksek bit hızı', 'زیادہ سے زیادہ بٹ ریٹ'],
+  'تلقائي': ['Auto', 'Auto', 'Otomatik', 'خودکار'],
+  'الخلفية': ['Rear', 'Arrière', 'Arka', 'پچھلا'],
+  'الأمامية': ['Front', 'Avant', 'Ön', 'اگلا'],
+  'صوت الكاميرا': ['Camera audio', 'Audio de la caméra', 'Kamera sesi', 'کیمرے کی آواز'],
+  'مكتوم': ['Muted', 'Coupé', 'Sessiz', 'خاموش'],
+  'المشاهدة': ['Viewing', 'Visionnage', 'İzleme', 'دیکھنا'],
+  'عرض الفيديو': ['Video fit', 'Affichage vidéo', 'Video görünümü', 'ویڈیو کا انداز'],
+  'كامل بدون قص': ['Full, no crop', 'Complet, sans rognage', 'Tam, kırpmasız', 'مکمل، بغیر کٹائی'],
+  'ملء الشاشة (قص)': ['Fill screen (crop)', 'Plein écran (rognage)', 'Ekranı doldur (kırp)', 'پوری اسکرین (کٹائی)'],
+  'الدخول للشاشة العريضة تلقائياً': ['Enter wide screen automatically', 'Passer en grand écran automatiquement', 'Geniş ekrana otomatik geç', 'خودکار وائیڈ اسکرین'],
+  'نعم': ['Yes', 'Oui', 'Evet', 'ہاں'],
+  'لا': ['No', 'Non', 'Hayır', 'نہیں'],
+  'المدى والشبكة': ['Range & network', 'Portée et réseau', 'Menzil ve ağ', 'رینج اور نیٹ ورک'],
+  'وضع المدى البعيد (جودة أقل = ثبات أكثر)': ['Long‑range mode (lower quality = more stable)', 'Mode longue portée (qualité réduite = plus stable)', 'Uzun menzil modu (düşük kalite = daha kararlı)', 'لانگ رینج موڈ (کم معیار = زیادہ استحکام)'],
+  'إيقاف': ['Off', 'Désactivé', 'Kapalı', 'بند'],
+  'تشغيل': ['On', 'Activé', 'Açık', 'آن'],
+  'الاتصال من خارج الشبكة المحلية (STUN)': ['Connect from outside the local network (STUN)', 'Connexion hors réseau local (STUN)', 'Yerel ağ dışından bağlan (STUN)', 'مقامی نیٹ ورک سے باہر کنکشن (STUN)'],
+  'ختم التاريخ والوقت على العرض': ['Date and time stamp on the picture', 'Horodatage sur l\'image', 'Görüntüde tarih ve saat damgası', 'تصویر پر تاریخ اور وقت'],
+  'إشعارات خارجية (والتطبيق مغلق)': ['External alerts (even when the app is closed)', 'Alertes externes (même app fermée)', 'Harici bildirimler (uygulama kapalıyken de)', 'بیرونی اطلاعات (ایپ بند ہونے پر بھی)'],
+  'جلب Chat ID': ['Fetch Chat ID', 'Récupérer le Chat ID', 'Chat ID al', 'Chat ID حاصل کریں'],
+  'إرسال اختبار': ['Send test', 'Envoyer un test', 'Test gönder', 'ٹیسٹ بھیجیں'],
+  'رسالة تجريبية': ['Test message', 'Message de test', 'Test mesajı', 'ٹیسٹ پیغام'],
+  'لم تُضبط أي قناة بعد': ['No channel is set up yet', 'Aucun canal configuré', 'Henüz bir kanal ayarlanmadı', 'ابھی کوئی چینل ترتیب نہیں دیا گیا'],
+  'وصلت الرسالة': ['Message delivered', 'Message envoyé', 'Mesaj ulaştı', 'پیغام پہنچ گیا'],
+  'فشل الإرسال: تحقق من البيانات والإنترنت': ['Sending failed: check the details and internet', 'Échec : vérifiez les données et Internet', 'Gönderilemedi: bilgileri ve interneti kontrol edin', 'بھیجنا ناکام: معلومات اور انٹرنیٹ چیک کریں'],
+  'خادم ntfy (اختياري)': ['ntfy server (optional)', 'Serveur ntfy (facultatif)', 'ntfy sunucusu (isteğe bağlı)', 'ntfy سرور (اختیاری)'],
+  'ملخص يومي بإشعار': ['Daily summary alert', 'Résumé quotidien', 'Günlük özet bildirimi', 'روزانہ خلاصہ اطلاع'],
+  '8 م': ['8 PM', '20 h', '20:00', 'رات 8 بجے'],
+  '9 م': ['9 PM', '21 h', '21:00', 'رات 9 بجے'],
+  '10 م': ['10 PM', '22 h', '22:00', 'رات 10 بجے'],
+  '11 م': ['11 PM', '23 h', '23:00', 'رات 11 بجے'],
+  'نسخ احتياطي': ['Backup', 'Sauvegarde', 'Yedekleme', 'بیک اپ'],
+  'رابط WebDAV (جهاز الكاميرا)': ['WebDAV URL (camera device)', 'URL WebDAV (appareil caméra)', 'WebDAV adresi (kamera cihazı)', 'WebDAV لنک (کیمرہ ڈیوائس)'],
+  'اسم المستخدم': ['Username', 'Nom d\'utilisateur', 'Kullanıcı adı', 'صارف نام'],
+  'كلمة المرور': ['Password', 'Mot de passe', 'Parola', 'پاس ورڈ'],
+  'نسخ التسجيلات إلى الصور تلقائياً (جهاز المشاهدة)': ['Copy recordings to Photos automatically (viewer device)', 'Copier les enregistrements dans Photos (appareil spectateur)', 'Kayıtları otomatik olarak Fotoğraflar\'a kopyala (izleyici cihaz)', 'ریکارڈنگز خودکار طور پر فوٹوز میں کاپی کریں (ناظر ڈیوائس)'],
+  'مساعدة': ['Help', 'Aide', 'Yardım', 'مدد'],
+  'التنبيهات (جهاز المشاهدة)': ['Alerts (viewer device)', 'Alertes (appareil spectateur)', 'Uyarılar (izleyici cihaz)', 'اطلاعات (ناظر ڈیوائس)'],
+  'تنبيه بطارية الكاميرا عند': ['Camera battery alert at', 'Alerte batterie caméra à', 'Kamera pil uyarısı', 'کیمرے کی بیٹری الرٹ'],
+  'تنبيه حرارة الكاميرا عند': ['Camera temperature alert at', 'Alerte température caméra à', 'Kamera sıcaklık uyarısı', 'کیمرے کا درجہ حرارت الرٹ'],
+  'صوت التنبيه': ['Alert sound', 'Son d\'alerte', 'Uyarı sesi', 'الرٹ کی آواز'],
+  'اهتزاز التنبيه': ['Alert vibration', 'Vibration d\'alerte', 'Uyarı titreşimi', 'الرٹ وائبریشن'],
+  'أقل فاصل بين تنبيهات الحركة والصوت': ['Minimum gap between motion and sound alerts', 'Délai minimal entre alertes mouvement/son', 'Hareket ve ses uyarıları arası en kısa süre', 'حرکت اور آواز الرٹس کے درمیان کم از کم وقفہ'],
+  '10 ث': ['10 s', '10 s', '10 sn', '10 سیکنڈ'],
+  '20 ث': ['20 s', '20 s', '20 sn', '20 سیکنڈ'],
+  'دقيقة': ['1 min', '1 min', '1 dk', '1 منٹ'],
+  'إعادة الاتصال التلقائية': ['Automatic reconnection', 'Reconnexion automatique', 'Otomatik yeniden bağlanma', 'خودکار دوبارہ کنکشن'],
+  'مفعّلة': ['Enabled', 'Activée', 'Etkin', 'فعال'],
+  'معطّلة': ['Disabled', 'Désactivée', 'Devre dışı', 'غیر فعال'],
+  'كتم الصوت عند الاتصال': ['Mute on connect', 'Couper le son à la connexion', 'Bağlanınca sessize al', 'کنکشن پر خاموش'],
+  'إبقاء الشاشة مضاءة': ['Keep screen on', 'Garder l\'écran allumé', 'Ekranı açık tut', 'اسکرین روشن رکھیں'],
+  'الأمان': ['Security', 'Sécurité', 'Güvenlik', 'سیکیورٹی'],
+  'محاولات PIN الخاطئة قبل القفل': ['Wrong PIN attempts before lockout', 'Essais PIN erronés avant blocage', 'Kilitlenmeden önce yanlış PIN denemesi', 'لاک سے پہلے غلط PIN کی کوششیں'],
+  'مدة القفل': ['Lockout duration', 'Durée du blocage', 'Kilitlenme süresi', 'لاک کی مدت'],
+  '5 دقائق': ['5 minutes', '5 minutes', '5 dakika', '5 منٹ'],
+  '15 دقيقة': ['15 minutes', '15 minutes', '15 dakika', '15 منٹ'],
+  'PIN جديد عند كل تشغيل للكاميرا': ['New PIN each time the camera starts', 'Nouveau PIN à chaque démarrage', 'Kamera her başladığında yeni PIN', 'کیمرہ شروع ہونے پر نیا PIN'],
+  'متقدم': ['Advanced', 'Avancé', 'Gelişmiş', 'ایڈوانسڈ'],
+  'نسخ معلومات التشخيص': ['Copy diagnostic info', 'Copier les infos de diagnostic', 'Tanılama bilgisini kopyala', 'تشخیصی معلومات کاپی کریں'],
+  'تُنسخ بدون الـ PIN، للصقها عند طلب المساعدة': ['Copied without the PIN, to paste when asking for help', 'Copié sans le PIN, à coller pour demander de l\'aide', 'PIN olmadan kopyalanır, yardım isterken yapıştırın', 'PIN کے بغیر کاپی ہوتی ہے، مدد مانگتے وقت چسپاں کریں'],
+  'إعادة ضبط كل الإعدادات': ['Reset all settings', 'Réinitialiser tous les réglages', 'Tüm ayarları sıfırla', 'تمام سیٹنگز ری سیٹ کریں'],
+  'تُحذف الإعدادات والكاميرات المحفوظة': ['Settings and saved cameras are deleted', 'Réglages et caméras enregistrées supprimés', 'Ayarlar ve kayıtlı kameralar silinir', 'سیٹنگز اور محفوظ کیمرے حذف ہوں گے'],
+  'إعادة ضبط كل شيء؟': ['Reset everything?', 'Tout réinitialiser ?', 'Her şey sıfırlansın mı?', 'سب کچھ ری سیٹ کریں؟'],
+  'إلغاء': ['Cancel', 'Annuler', 'İptal', 'منسوخ'],
+  'إعادة ضبط': ['Reset', 'Réinitialiser', 'Sıfırla', 'ری سیٹ'],
+  'مشاركة الشاشة والتحكم': ['Screen sharing & control', 'Partage d\'écran et contrôle', 'Ekran paylaşımı ve kontrol', 'اسکرین شیئرنگ اور کنٹرول'],
+  'الإطارات في الثانية (الحد الأعلى)': ['Frames per second (maximum)', 'Images par seconde (max)', 'Saniyedeki kare (en çok)', 'فریم فی سیکنڈ (زیادہ سے زیادہ)'],
+  'جودة الصورة': ['Image quality', 'Qualité d\'image', 'Görüntü kalitesi', 'تصویر کا معیار'],
+  'سريعة جداً': ['Very fast', 'Très rapide', 'Çok hızlı', 'بہت تیز'],
+  'سريعة': ['Fast', 'Rapide', 'Hızlı', 'تیز'],
+  'متوازنة': ['Balanced', 'Équilibrée', 'Dengeli', 'متوازن'],
+  'بانتظار المشاهد': ['Waiting for a viewer', 'En attente d\'un spectateur', 'İzleyici bekleniyor', 'ناظر کا انتظار'],
+  'بطارية الكاميرا منخفضة': ['Camera battery low', 'Batterie de la caméra faible', 'Kamera pili düşük', 'کیمرے کی بیٹری کم ہے'],
+  'فُصل الشاحن': ['Charger disconnected', 'Chargeur débranché', 'Şarj cihazı çıkarıldı', 'چارجر ہٹا دیا گیا'],
+  'صوت عالٍ عند الكاميرا': ['Loud sound at the camera', 'Son fort près de la caméra', 'Kamerada yüksek ses', 'کیمرے کے پاس تیز آواز'],
+  'حركة مكتشفة': ['Motion detected', 'Mouvement détecté', 'Hareket algılandı', 'حرکت کا پتہ چلا'],
+  'ملخص اليوم': ['Daily summary', 'Résumé du jour', 'Günün özeti', 'آج کا خلاصہ'],
+  'اليوم': ['Today', 'Aujourd\'hui', 'Bugün', 'آج'],
+  'ربط سريع عبر QR': ['Quick pairing with QR', 'Association rapide par QR', 'QR ile hızlı eşleştirme', 'QR سے فوری جوڑیں'],
+  'تحكم كامل': ['Full control', 'Contrôle total', 'Tam kontrol', 'مکمل کنٹرول'],
+  'مشاهدة فقط': ['View only', 'Lecture seule', 'Yalnızca izleme', 'صرف دیکھنا'],
+  'الرمز يحتوي على الـ PIN — لا تعرضه لأحد لا تثق به.': ['The code contains the PIN — don\'t show it to anyone you don\'t trust.', 'Le code contient le PIN — ne le montrez qu\'à des personnes de confiance.', 'Kod PIN içerir — güvenmediğiniz kimseye göstermeyin.', 'کوڈ میں PIN ہے — کسی غیر معتبر کو نہ دکھائیں۔'],
+  'إغلاق': ['Close', 'Fermer', 'Kapat', 'بند کریں'],
+  'الشاشة جاهزة للمشاهدة': ['Screen ready to view', 'Écran prêt à être visionné', 'Ekran izlemeye hazır', 'اسکرین دیکھنے کے لیے تیار'],
+  'التحكم عن بعد مفعّل': ['Remote control enabled', 'Contrôle à distance activé', 'Uzaktan kontrol açık', 'ریموٹ کنٹرول فعال'],
+  'إيقاف مشاركة الشاشة': ['Stop screen sharing', 'Arrêter le partage d\'écran', 'Ekran paylaşımını durdur', 'اسکرین شیئرنگ بند کریں'],
+  'بدء مشاركة الشاشة': ['Start screen sharing', 'Démarrer le partage d\'écran', 'Ekran paylaşımını başlat', 'اسکرین شیئرنگ شروع کریں'],
+  'تفعيل التحكم (إمكانية الوصول)': ['Enable control (Accessibility)', 'Activer le contrôle (Accessibilité)', 'Kontrolü etkinleştir (Erişilebilirlik)', 'کنٹرول فعال کریں (ایکسیسبیلٹی)'],
+  'العنوان': ['Address', 'Adresse', 'Adres', 'ایڈریس'],
+  'رمز الدخول (PIN)': ['Access code (PIN)', 'Code d\'accès (PIN)', 'Giriş kodu (PIN)', 'رسائی کوڈ (PIN)'],
+  'رمز المشاهدة فقط': ['View‑only code', 'Code lecture seule', 'Yalnızca izleme kodu', 'صرف دیکھنے کا کوڈ'],
+  'متصل — يوجد مشاهد': ['Connected — a viewer is watching', 'Connecté — un spectateur regarde', 'Bağlı — bir izleyici var', 'کنکٹڈ — ناظر موجود ہے'],
+  'عرض رمز QR للربط': ['Show pairing QR code', 'Afficher le code QR', 'Eşleştirme QR kodunu göster', 'جوڑنے کا QR کوڈ دکھائیں'],
+  'الاتصال مشفّر (TLS)': ['Connection encrypted (TLS)', 'Connexion chiffrée (TLS)', 'Bağlantı şifreli (TLS)', 'کنکشن خفیہ (TLS)'],
+  'الاتصال غير مشفّر — أضف شهادة TLS في البناء': ['Connection not encrypted — add a TLS certificate in the build', 'Connexion non chiffrée — ajoutez un certificat TLS', 'Bağlantı şifresiz — derlemeye TLS sertifikası ekleyin', 'کنکشن خفیہ نہیں — بلڈ میں TLS سرٹیفکیٹ شامل کریں'],
+  'كشف الحركة': ['Motion detection', 'Détection de mouvement', 'Hareket algılama', 'حرکت کی شناخت'],
+  'الإعدادات الكاملة من جهاز المشاهدة (زر الأمان)': ['Full settings from the viewer device (Security button)', 'Réglages complets depuis l\'appareil spectateur (bouton Sécurité)', 'Tüm ayarlar izleyici cihazdan (Güvenlik düğmesi)', 'مکمل سیٹنگز ناظر ڈیوائس سے (سیکیورٹی بٹن)'],
+  'توفير الطاقة': ['Power saving', 'Économie d\'énergie', 'Güç tasarrufu', 'بجلی کی بچت'],
+  'شاشة سوداء إذا لم يشاهد أحد لمدة دقيقة': ['Black screen if nobody watches for a minute', 'Écran noir si personne ne regarde pendant une minute', 'Bir dakika kimse izlemezse siyah ekran', 'ایک منٹ تک کوئی نہ دیکھے تو سیاہ اسکرین'],
+  'جاهزية دائمة': ['Always ready', 'Toujours prêt', 'Her zaman hazır', 'ہمیشہ تیار'],
+  'اتصل في أي وقت حتى لو التطبيق مغلق': ['Connect any time, even if the app is closed', 'Connectez-vous à tout moment, même app fermée', 'Uygulama kapalı olsa bile istediğiniz zaman bağlanın', 'ایپ بند ہو تب بھی کسی بھی وقت جڑیں'],
+  'بدء الكاميرا عند الشحن': ['Start camera when charging', 'Démarrer la caméra au branchement', 'Şarja takılınca kamerayı başlat', 'چارجنگ پر کیمرہ شروع کریں'],
+  'وصّل الشاحن فتبدأ الكاميرا تلقائياً': ['Plug in the charger and the camera starts automatically', 'Branchez le chargeur : la caméra démarre seule', 'Şarjı takın, kamera otomatik başlar', 'چارجر لگائیں، کیمرہ خود شروع ہو جائے گا'],
+  'إيقاف التسجيل': ['Stop recording', 'Arrêter l\'enregistrement', 'Kaydı durdur', 'ریکارڈنگ بند کریں'],
+  'التسجيل متاح على Android فقط': ['Recording is available on Android only', 'Enregistrement disponible sur Android uniquement', 'Kayıt yalnızca Android\'de', 'ریکارڈنگ صرف اینڈرائیڈ پر دستیاب'],
+  'حركة': ['Motion', 'Mouvement', 'Hareket', 'حرکت'],
+  'وضع توفير الطاقة — المس الشاشة': ['Power‑saving mode — touch the screen', 'Mode économie d\'énergie — touchez l\'écran', 'Güç tasarrufu modu — ekrana dokunun', 'بجلی بچت موڈ — اسکرین کو چھوئیں'],
+  'منزل': ['Home', 'Maison', 'Ev', 'گھر'],
+  'غرفة طفل': ['Baby room', 'Chambre de bébé', 'Bebek odası', 'بچے کا کمرہ'],
+  'متجر': ['Shop', 'Boutique', 'Mağaza', 'دکان'],
+  'جاري البحث عن الكاميرات...': ['Searching for cameras...', 'Recherche de caméras...', 'Kameralar aranıyor...', 'کیمرے تلاش کیے جا رہے ہیں...'],
+  'ما لقيت كاميرا على الشبكة': ['No camera found on the network', 'Aucune caméra trouvée sur le réseau', 'Ağda kamera bulunamadı', 'نیٹ ورک پر کوئی کیمرہ نہیں ملا'],
+  'تم إيقاف المحاولة': ['Retry stopped', 'Tentative arrêtée', 'Deneme durduruldu', 'کوشش روک دی گئی'],
+  'انقطع الاتصال بالكاميرا — جاري إعادة الاتصال': ['Camera disconnected — reconnecting', 'Caméra déconnectée — reconnexion', 'Kamera bağlantısı koptu — yeniden bağlanıyor', 'کیمرے سے رابطہ ٹوٹ گیا — دوبارہ جڑ رہا ہے'],
+  'اكتب IP الكاميرا أو اضغط بحث': ['Enter the camera IP or tap Search', 'Saisissez l\'IP de la caméra ou touchez Rechercher', 'Kamera IP\'sini yazın veya Ara\'ya dokunun', 'کیمرے کا IP لکھیں یا تلاش دبائیں'],
+  'جاري الاتصال...': ['Connecting...', 'Connexion...', 'Bağlanıyor...', 'جڑ رہا ہے...'],
+  'الكاميرا مغلقة — جاري إيقاظها...': ['Camera is off — waking it...', 'Caméra éteinte — réveil...', 'Kamera kapalı — uyandırılıyor...', 'کیمرہ بند ہے — جگایا جا رہا ہے...'],
+  'PIN غير صحيح': ['Wrong PIN', 'PIN incorrect', 'PIN yanlış', 'PIN غلط ہے'],
+  'محاولات خاطئة كثيرة — انتظر 5 دقائق': ['Too many wrong attempts — wait 5 minutes', 'Trop d\'essais erronés — attendez 5 minutes', 'Çok fazla hatalı deneme — 5 dakika bekleyin', 'بہت زیادہ غلط کوششیں — 5 منٹ انتظار کریں'],
+  'رمز غير صالح': ['Invalid code', 'Code invalide', 'Geçersiz kod', 'غلط کوڈ'],
+  'لا يوجد بث': ['No stream', 'Pas de flux', 'Yayın yok', 'کوئی سٹریم نہیں'],
+  'تم حفظ اللقطة في الصور': ['Snapshot saved to Photos', 'Capture enregistrée dans Photos', 'Görüntü Fotoğraflar\'a kaydedildi', 'تصویر فوٹوز میں محفوظ ہو گئی'],
+  'تعذّر التقاط الصورة': ['Could not capture the image', 'Impossible de capturer l\'image', 'Görüntü alınamadı', 'تصویر نہیں لی جا سکی'],
+  'رؤية ليلية (تحسين العرض)': ['Night view (display enhancement)', 'Vision nocturne (amélioration d\'affichage)', 'Gece görüşü (görüntü iyileştirme)', 'رات کا منظر (ڈسپلے بہتری)'],
+  'ليلي': ['Night', 'Nuit', 'Gece', 'رات'],
+  'ليلي قوي': ['Strong night', 'Nuit renforcé', 'Güçlü gece', 'تیز رات'],
+  'ختم التاريخ والوقت': ['Date & time stamp', 'Horodatage', 'Tarih ve saat damgası', 'تاریخ اور وقت'],
+  'وضع المدى البعيد': ['Long‑range mode', 'Mode longue portée', 'Uzun menzil modu', 'لانگ رینج موڈ'],
+  'يخفّض الجودة ليبقى الاتصال ثابتاً مع الإشارة الضعيفة': ['Lowers quality to keep the link stable on a weak signal', 'Réduit la qualité pour garder le lien stable', 'Zayıf sinyalde bağlantıyı korumak için kaliteyi düşürür', 'کمزور سگنل پر کنکشن مستحکم رکھنے کے لیے معیار کم کرتا ہے'],
+  'إعادة ضبط الزوم': ['Reset zoom', 'Réinitialiser le zoom', 'Yakınlaştırmayı sıfırla', 'زوم ری سیٹ کریں'],
+  'حركة مكتشفة في الكاميرا': ['Motion detected at the camera', 'Mouvement détecté à la caméra', 'Kamerada hareket algılandı', 'کیمرے پر حرکت کا پتہ چلا'],
+  'تجاهل المناطق': ['Ignore zones', 'Ignorer les zones', 'Bölgeleri yoksay', 'زونز نظر انداز کریں'],
+  'مراقبة المناطق فقط': ['Watch zones only', 'Surveiller les zones seulement', 'Yalnızca bölgeleri izle', 'صرف زونز کی نگرانی'],
+  'مسح': ['Clear', 'Effacer', 'Temizle', 'صاف کریں'],
+  'الأمان والمراقبة الذكية': ['Security & smart monitoring', 'Sécurité et surveillance intelligente', 'Güvenlik ve akıllı izleme', 'سیکیورٹی اور سمارٹ نگرانی'],
+  'تنبيه مع لقطة عند وجود حركة': ['Alert with a snapshot when there is motion', 'Alerte avec capture en cas de mouvement', 'Hareket olunca görüntülü uyarı', 'حرکت پر تصویر کے ساتھ الرٹ'],
+  'تسجيل تلقائي عند الحركة': ['Auto‑record on motion', 'Enregistrement auto sur mouvement', 'Harekette otomatik kayıt', 'حرکت پر خودکار ریکارڈنگ'],
+  'الحساسية': ['Sensitivity', 'Sensibilité', 'Hassasiyet', 'حساسیت'],
+  'تصفية الإنذارات الكاذبة': ['False‑alarm filter', 'Filtre de fausses alertes', 'Yanlış alarm filtresi', 'غلط الارم فلٹر'],
+  'تسجيل ما قبل الحركة': ['Pre‑motion recording', 'Enregistrement pré‑mouvement', 'Hareket öncesi kayıt', 'حرکت سے پہلے کی ریکارڈنگ'],
+  'اعتماد الأشخاص فقط': ['Count people only', 'Compter uniquement les personnes', 'Yalnızca kişileri say', 'صرف افراد شمار کریں'],
+  'كشف الصوت': ['Sound detection', 'Détection sonore', 'Ses algılama', 'آواز کی شناخت'],
+  'جدول زمني': ['Schedule', 'Planning', 'Zamanlama', 'شیڈول'],
+  'الحركة والصوت يعملان في هذه الساعات فقط': ['Motion and sound work only during these hours', 'Mouvement et son actifs seulement à ces heures', 'Hareket ve ses yalnızca bu saatlerde çalışır', 'حرکت اور آواز صرف انہی اوقات میں کام کرتے ہیں'],
+  'من': ['From', 'De', 'Başlangıç', 'سے'],
+  'إلى': ['To', 'À', 'Bitiş', 'تک'],
+  'مكتبة التسجيلات والأحداث': ['Recordings & events library', 'Bibliothèque d\'enregistrements et d\'événements', 'Kayıt ve olay kitaplığı', 'ریکارڈنگز اور ایونٹس لائبریری'],
+  'تصفح وتنزيل وحذف من جهاز الكاميرا': ['Browse, download and delete from the camera device', 'Parcourir, télécharger et supprimer depuis la caméra', 'Kamera cihazından gözat, indir, sil', 'کیمرہ ڈیوائس سے دیکھیں، ڈاؤن لوڈ اور حذف کریں'],
+  'تشغيل صفارة على الكاميرا': ['Sound a siren on the camera', 'Déclencher une sirène sur la caméra', 'Kamerada siren çal', 'کیمرے پر سائرن بجائیں'],
+  'نغمة تنبيه واهتزاز لمدة 15 ثانية': ['Alert tone and vibration for 15 seconds', 'Tonalité et vibration pendant 15 s', '15 saniye uyarı sesi ve titreşim', '15 سیکنڈ الرٹ ٹون اور وائبریشن'],
+  'تحديد مناطق الكشف': ['Set detection zones', 'Définir les zones de détection', 'Algılama bölgelerini belirle', 'شناخت کے زونز مقرر کریں'],
+  'تسجيل دوّار (حذف الأقدم تلقائياً)': ['Loop recording (delete oldest automatically)', 'Enregistrement en boucle (supprime les plus anciens)', 'Döngüsel kayıt (en eskiyi otomatik sil)', 'لوپ ریکارڈنگ (پرانی خودکار حذف)'],
+  'تصوير زمني (لقطة كل)': ['Time‑lapse (a frame every)', 'Time‑lapse (une image toutes les)', 'Zaman atlamalı (her ... bir kare)', 'ٹائم لیپس (ہر ... پر فریم)'],
+  'لا توجد أحداث بعد': ['No events yet', 'Aucun événement', 'Henüz olay yok', 'ابھی کوئی ایونٹ نہیں'],
+  'لحظة الحدث': ['Moment of the event', 'Moment de l\'événement', 'Olay anı', 'ایونٹ کا لمحہ'],
+  'بعد 3 ثوانٍ': ['After 3 seconds', '3 secondes après', '3 saniye sonra', '3 سیکنڈ بعد'],
+  'تم الحفظ في الصور': ['Saved to Photos', 'Enregistré dans Photos', 'Fotoğraflar\'a kaydedildi', 'فوٹوز میں محفوظ ہو گیا'],
+  'تعذّر الحفظ': ['Could not save', 'Échec de l\'enregistrement', 'Kaydedilemedi', 'محفوظ نہیں ہو سکا'],
+  'حفظ في الصور': ['Save to Photos', 'Enregistrer dans Photos', 'Fotoğraflar\'a kaydet', 'فوٹوز میں محفوظ کریں'],
+  'متصل — التحكم مفعّل': ['Connected — control enabled', 'Connecté — contrôle activé', 'Bağlı — kontrol açık', 'کنکٹڈ — کنٹرول فعال'],
+  'رجوع': ['Back', 'Retour', 'Geri', 'واپس'],
+  'الرئيسية': ['Home', 'Accueil', 'Ana ekran', 'ہوم'],
+  'التطبيقات': ['Apps', 'Applications', 'Uygulamalar', 'ایپس'],
+  'الإشعارات': ['Notifications', 'Notifications', 'Bildirimler', 'اطلاعات'],
+  'تصغير': ['Shrink', 'Réduire', 'Küçült', 'چھوٹا کریں'],
+  'عريض': ['Wide', 'Large', 'Geniş', 'وسیع'],
+  'اتصل بالكاميرا أولاً': ['Connect to the camera first', 'Connectez-vous d\'abord à la caméra', 'Önce kameraya bağlanın', 'پہلے کیمرے سے جڑیں'],
+  'الصوت': ['Sound', 'Son', 'Ses', 'آواز'],
+  'لقطة': ['Snapshot', 'Capture', 'Görüntü al', 'تصویر'],
+  'التسجيلات': ['Recordings', 'Enregistrements', 'Kayıtlar', 'ریکارڈنگز'],
+  'ميكروفون': ['Mic', 'Micro', 'Mikrofon', 'مائیک'],
+  'قلب': ['Flip', 'Retourner', 'Çevir', 'پلٹیں'],
+  'فلاش': ['Torch', 'Lampe', 'Fener', 'ٹارچ'],
+  'الأحداث': ['Events', 'Événements', 'Olaylar', 'ایونٹس'],
+  'بحث': ['Search', 'Rechercher', 'Ara', 'تلاش'],
+  'اتصال': ['Connect', 'Connexion', 'Bağlan', 'جڑیں'],
+  'تعديل الاسم واللون': ['Edit name & colour', 'Modifier nom et couleur', 'Ad ve rengi düzenle', 'نام اور رنگ ایڈٹ کریں'],
+  'تقديم': ['Move earlier', 'Avancer', 'Öne al', 'آگے کریں'],
+  'تأخير': ['Move later', 'Reculer', 'Geriye al', 'پیچھے کریں'],
+  'حذف': ['Delete', 'Supprimer', 'Sil', 'حذف کریں'],
+  'أضف حتى 4 كاميرات وشاهدها معاً': ['Add up to 4 cameras and watch them together', 'Ajoutez jusqu\'à 4 caméras', 'En fazla 4 kamera ekleyip birlikte izleyin', '4 کیمرے تک شامل کر کے ایک ساتھ دیکھیں'],
+  'إضافة كاميرا': ['Add a camera', 'Ajouter une caméra', 'Kamera ekle', 'کیمرہ شامل کریں'],
+  'الاسم (مثلاً: المدخل)': ['Name (e.g. Entrance)', 'Nom (ex. Entrée)', 'Ad (ör. Giriş)', 'نام (مثلاً: داخلی دروازہ)'],
+  'إضافة': ['Add', 'Ajouter', 'Ekle', 'شامل کریں'],
+  'حفظ': ['Save', 'Enregistrer', 'Kaydet', 'محفوظ کریں'],
+  'الكاميرا غير متاحة': ['Camera unavailable', 'Caméra indisponible', 'Kamera kullanılamıyor', 'کیمرہ دستیاب نہیں'],
+  'الكاميرا لا تستجيب': ['Camera not responding', 'La caméra ne répond pas', 'Kamera yanıt vermiyor', 'کیمرہ جواب نہیں دے رہا'],
+  'تعذّر الاتصال': ['Could not connect', 'Connexion impossible', 'Bağlanılamadı', 'کنکشن نہیں ہو سکا'],
+  'انتهت المهلة': ['Timed out', 'Délai dépassé', 'Zaman aşımı', 'وقت ختم ہو گیا'],
+  'تعذّر جلب القائمة': ['Could not load the list', 'Impossible de charger la liste', 'Liste alınamadı', 'فہرست حاصل نہیں ہو سکی'],
+  'تعذّر الاتصال بالكاميرا': ['Could not reach the camera', 'Impossible de joindre la caméra', 'Kameraya ulaşılamadı', 'کیمرے تک رسائی نہیں ہو سکی'],
+  'تم تنزيل التسجيل وحفظه في الصور': ['Recording downloaded and saved to Photos', 'Enregistrement téléchargé et ajouté à Photos', 'Kayıt indirildi ve Fotoğraflar\'a kaydedildi', 'ریکارڈنگ ڈاؤن لوڈ ہو کر فوٹوز میں محفوظ ہو گئی'],
+  'تعذّر تنزيل التسجيل': ['Could not download the recording', 'Impossible de télécharger', 'Kayıt indirilemedi', 'ریکارڈنگ ڈاؤن لوڈ نہیں ہو سکی'],
+  'حذف من جهاز الكاميرا؟': ['Delete from the camera device?', 'Supprimer de la caméra ?', 'Kamera cihazından silinsin mi?', 'کیمرہ ڈیوائس سے حذف کریں؟'],
+  'تعذّر الحذف': ['Could not delete', 'Suppression impossible', 'Silinemedi', 'حذف نہیں ہو سکا'],
+  'ملخص الأحداث': ['Events summary', 'Résumé des événements', 'Olay özeti', 'ایونٹس کا خلاصہ'],
+  'أمس': ['Yesterday', 'Hier', 'Dün', 'کل'],
+  'تنزيل إلى الصور': ['Download to Photos', 'Télécharger dans Photos', 'Fotoğraflar\'a indir', 'فوٹوز میں ڈاؤن لوڈ کریں'],
+  'لقطة حدث': ['Event snapshot', 'Capture d\'événement', 'Olay görüntüsü', 'ایونٹ کی تصویر'],
+  'تسجيلات وأحداث الكاميرا': ['Camera recordings & events', 'Enregistrements et événements', 'Kamera kayıtları ve olayları', 'کیمرے کی ریکارڈنگز اور ایونٹس'],
+  'لا توجد تسجيلات أو أحداث': ['No recordings or events', 'Aucun enregistrement ni événement', 'Kayıt veya olay yok', 'کوئی ریکارڈنگ یا ایونٹ نہیں'],
+  'لا توجد لقطات': ['No frames', 'Aucune image', 'Kare yok', 'کوئی فریم نہیں'],
+  'افتح LAN Cam': ['Open LAN Cam', 'Ouvrir LAN Cam', 'LAN Cam\'i aç', 'LAN Cam کھولیں'],
+  'التطبيق مقفل': ['The app is locked', 'L\'application est verrouillée', 'Uygulama kilitli', 'ایپ مقفل ہے'],
+  'فتح بالبصمة أو الوجه': ['Unlock with fingerprint or face', 'Déverrouiller par empreinte ou visage', 'Parmak izi veya yüzle aç', 'فنگر پرنٹ یا چہرے سے کھولیں'],
+  'الرمز غير صحيح': ['Wrong code', 'Code incorrect', 'Kod yanlış', 'کوڈ غلط ہے'],
+  'ساعدني': ['Help me', 'Aidez-moi', 'Bana yardım et', 'میری مدد کریں'],
+  'فحص سريع مع أزرار إصلاح': ['Quick check with fix buttons', 'Vérification rapide avec boutons de réparation', 'Düzeltme düğmeli hızlı kontrol', 'فوری جانچ مع ٹھیک کرنے کے بٹن'],
+  'أدلة مصورة': ['Illustrated guides', 'Guides illustrés', 'Resimli rehberler', 'تصویری رہنما'],
+  'تثبيت الكاميرا في مكانها': ['Mounting the camera', 'Installer la caméra', 'Kamerayı yerleştirme', 'کیمرہ لگانا'],
+  'ضبط مناطق الكشف': ['Setting detection zones', 'Régler les zones de détection', 'Algılama bölgelerini ayarlama', 'شناخت کے زونز مقرر کرنا'],
+  'فتح الأذونات': ['Granting permissions', 'Accorder les autorisations', 'İzinleri verme', 'اجازتیں دینا'],
+  'المشاهدة من خارج البيت': ['Watching from outside home', 'Regarder hors de la maison', 'Evin dışından izleme', 'گھر سے باہر دیکھنا'],
+  'المشاهدة من المتصفح': ['Watching from a browser', 'Regarder depuis un navigateur', 'Tarayıcıdan izleme', 'براؤزر سے دیکھنا'],
+  'اختر المكان': ['Choose the spot', 'Choisissez l\'emplacement', 'Yeri seçin', 'جگہ چنیں'],
+  'اختر مكاناً مرتفعاً يرى المنطقة كلها، وبعيداً عن الضوء المباشر.': ['Pick a high spot that sees the whole area, away from direct light.', 'Choisissez un endroit élevé qui voit toute la zone, loin de la lumière directe.', 'Tüm alanı gören yüksek bir yer seçin, doğrudan ışıktan uzak.', 'ایسی اونچی جگہ چنیں جو پورا علاقہ دیکھے، براہِ راست روشنی سے دور۔'],
+  'ثبّت الهاتف': ['Fix the phone in place', 'Fixez le téléphone', 'Telefonu sabitleyin', 'فون کو جما دیں'],
+  'ثبّت الهاتف أفقياً بحامل أو شريط لاصق، وتأكد أن العدسة غير محجوبة.': ['Mount it horizontally with a stand or tape, and make sure the lens is not blocked.', 'Fixez-le à l\'horizontale avec un support ou du ruban, objectif dégagé.', 'Yatay olarak bir stand veya bantla sabitleyin, lens kapalı olmasın.', 'اسے افقی طور پر اسٹینڈ یا ٹیپ سے لگائیں، لینس بند نہ ہو۔'],
+  'وصّل الشاحن': ['Connect the charger', 'Branchez le chargeur', 'Şarjı takın', 'چارجر لگائیں'],
+  'ابقِ الهاتف على الشاحن، وفعّل "جاهزية دائمة" و"بدء الكاميرا عند الشحن".': ['Keep the phone charging and turn on "Always ready" and "Start camera when charging".', 'Laissez le téléphone en charge et activez « Toujours prêt » et « Démarrer la caméra au branchement ».', 'Telefonu şarjda tutun ve "Her zaman hazır" ile "Şarja takılınca kamerayı başlat"ı açın.', 'فون چارج پر رکھیں اور "ہمیشہ تیار" اور "چارجنگ پر کیمرہ شروع کریں" آن کریں۔'],
+  'تأكد من الإشارة': ['Check the signal', 'Vérifiez le signal', 'Sinyali kontrol edin', 'سگنل چیک کریں'],
+  'قوة الواي فاي في المكان مهمة. جرّب البث وراقب مؤشر "اتصال قوي".': ['Wi‑Fi strength at that spot matters. Try the stream and watch the "Strong link" indicator.', 'La force du Wi‑Fi à cet endroit compte. Essayez le flux et surveillez l\'indicateur « Lien fort ».', 'O noktadaki Wi‑Fi gücü önemlidir. Yayını deneyin ve "Güçlü bağlantı" göstergesine bakın.', 'اس جگہ وائی فائی کی طاقت اہم ہے۔ سٹریم آزمائیں اور "مضبوط کنکشن" کا نشان دیکھیں۔'],
+  'افتح الأمان': ['Open Security', 'Ouvrez Sécurité', 'Güvenliği açın', 'سیکیورٹی کھولیں'],
+  'من شاشة المشاهدة اضغط "الأمان" ثم "تحديد مناطق الكشف".': ['On the viewing screen tap "Security", then "Set detection zones".', 'Sur l\'écran de visionnage, touchez « Sécurité » puis « Définir les zones de détection ».', 'İzleme ekranında "Güvenlik", sonra "Algılama bölgelerini belirle"ye dokunun.', 'دیکھنے کی اسکرین پر "سیکیورٹی" پھر "شناخت کے زونز مقرر کریں" دبائیں۔'],
+  'لوّن الخانات': ['Paint the cells', 'Coloriez les cases', 'Hücreleri boyayın', 'خانوں پر رنگ لگائیں'],
+  'مرّر إصبعك على الخانات التي تريد تجاهلها، مثل شجرة تتحرك أو شارع.': ['Drag your finger over the cells you want to ignore, like a moving tree or a street.', 'Faites glisser le doigt sur les cases à ignorer, comme un arbre qui bouge ou une rue.', 'Yok saymak istediğiniz hücrelerin üzerinde parmağınızı gezdirin (hareket eden ağaç, sokak gibi).', 'جن خانوں کو نظر انداز کرنا ہے ان پر انگلی پھیریں، جیسے ہلتا درخت یا سڑک۔'],
+  'اختر الوضع': ['Choose the mode', 'Choisissez le mode', 'Modu seçin', 'موڈ چنیں'],
+  'اختر "تجاهل المناطق" أو "مراقبة المناطق فقط" حسب حاجتك.': ['Choose "Ignore zones" or "Watch zones only" as you need.', 'Choisissez « Ignorer les zones » ou « Surveiller les zones seulement » selon le besoin.', 'İhtiyacınıza göre "Bölgeleri yoksay" veya "Yalnızca bölgeleri izle"yi seçin.', 'ضرورت کے مطابق "زونز نظر انداز کریں" یا "صرف زونز کی نگرانی" چنیں۔'],
+  'احفظ': ['Save', 'Enregistrez', 'Kaydedin', 'محفوظ کریں'],
+  'اضغط "تم". جرّب بتحريك يدك أمام الكاميرا للتأكد.': ['Tap "Done". Wave your hand in front of the camera to test.', 'Touchez « Terminé ». Agitez la main devant la caméra pour tester.', '"Tamam"a dokunun. Test için elinizi kameranın önünde sallayın.', '"ہو گیا" دبائیں۔ جانچ کے لیے کیمرے کے سامنے ہاتھ ہلائیں۔'],
+  'الكاميرا والميكروفون': ['Camera and microphone', 'Caméra et micro', 'Kamera ve mikrofon', 'کیمرہ اور مائیکروفون'],
+  'اضغط "السماح" عند الطلب، وهما ضروريان للبث والصوت.': ['Tap "Allow" when asked; both are required for video and sound.', 'Touchez « Autoriser » quand on vous le demande ; les deux sont nécessaires.', 'İstendiğinde "İzin ver"e dokunun; yayın ve ses için gereklidir.', 'پوچھنے پر "اجازت دیں" دبائیں؛ دونوں ویڈیو اور آواز کے لیے ضروری ہیں۔'],
+  'استثناء البطارية': ['Battery exemption', 'Exemption batterie', 'Pil muafiyeti', 'بیٹری استثنا'],
+  'يمنع النظام من إغلاق التطبيق وهو يعمل في الخلفية.': ['Stops the system from closing the app while it runs in the background.', 'Empêche le système de fermer l\'app en arrière-plan.', 'Sistemin arka planda çalışan uygulamayı kapatmasını engeller.', 'سسٹم کو بیک گراؤنڈ میں چلتی ایپ بند کرنے سے روکتا ہے۔'],
+  'يلزم لإيقاظ الكاميرا وهي مغلقة.': ['Needed to wake the camera while it is closed.', 'Nécessaire pour réveiller la caméra fermée.', 'Kapalıyken kamerayı uyandırmak için gerekir.', 'بند کیمرے کو جگانے کے لیے ضروری ہے۔'],
+  'إمكانية الوصول (اختياري)': ['Accessibility (optional)', 'Accessibilité (facultatif)', 'Erişilebilirlik (isteğe bağlı)', 'ایکسیسبیلٹی (اختیاری)'],
+  'للتحكم بشاشة الهاتف عن بعد. افتح فحص المشاكل لمتابعة الخطوات.': ['For controlling the phone screen remotely. Open the problem check to continue.', 'Pour contrôler l\'écran à distance. Ouvrez le diagnostic pour continuer.', 'Telefon ekranını uzaktan kontrol etmek için. Devam etmek için sorun kontrolünü açın.', 'فون اسکرین کو دور سے کنٹرول کرنے کے لیے۔ آگے بڑھنے کو مسئلہ جانچ کھولیں۔'],
+  'ثبّت Tailscale': ['Install Tailscale', 'Installez Tailscale', 'Tailscale\'i kurun', 'Tailscale انسٹال کریں'],
+  'ثبّت تطبيق Tailscale المجاني على هاتف الكاميرا وهاتف المشاهد.': ['Install the free Tailscale app on both the camera phone and the viewer phone.', 'Installez l\'app gratuite Tailscale sur le téléphone caméra et le téléphone spectateur.', 'Ücretsiz Tailscale uygulamasını hem kamera hem izleyici telefonuna kurun.', 'مفت Tailscale ایپ کیمرہ فون اور ناظر فون دونوں پر انسٹال کریں۔'],
+  'سجّل بنفس الحساب': ['Sign in with the same account', 'Connectez-vous avec le même compte', 'Aynı hesapla giriş yapın', 'ایک ہی اکاؤنٹ سے لاگ اِن کریں'],
+  'سجّل الدخول في التطبيقين بنفس الحساب، وفعّل الاتصال (VPN).': ['Sign in to both apps with the same account and turn the connection (VPN) on.', 'Connectez-vous aux deux apps avec le même compte et activez la connexion (VPN).', 'İki uygulamada da aynı hesapla giriş yapın ve bağlantıyı (VPN) açın.', 'دونوں ایپس میں ایک ہی اکاؤنٹ سے لاگ اِن کریں اور کنکشن (VPN) آن کریں۔'],
+  'اعرف عنوان الكاميرا': ['Find the camera address', 'Trouvez l\'adresse de la caméra', 'Kamera adresini bulun', 'کیمرے کا ایڈریس معلوم کریں'],
+  'على هاتف الكاميرا يظهر عنوان يبدأ بـ 100. بجانب كلمة VPN. استخدمه بدل عنوان الواي فاي.': ['On the camera phone an address starting with 100. appears next to "VPN". Use it instead of the Wi‑Fi address.', 'Sur le téléphone caméra, une adresse commençant par 100. apparaît près de « VPN ». Utilisez-la à la place de l\'adresse Wi‑Fi.', 'Kamera telefonunda "VPN" yanında 100. ile başlayan bir adres görünür. Wi‑Fi adresi yerine onu kullanın.', 'کیمرہ فون پر "VPN" کے ساتھ 100. سے شروع ہونے والا ایڈریس نظر آتا ہے۔ وائی فائی ایڈریس کی جگہ یہ استعمال کریں۔'],
+  'جرّب الاتصال': ['Try the connection', 'Essayez la connexion', 'Bağlantıyı deneyin', 'کنکشن آزمائیں'],
+  'اكتب ذلك العنوان في المشاهد أو في "اختبار الاتصال". لا تفتح منافذ الراوتر.': ['Enter that address in the viewer or in "Test connection". Do not open router ports.', 'Saisissez cette adresse dans le spectateur ou dans « Tester la connexion ». N\'ouvrez pas de ports sur le routeur.', 'Bu adresi izleyiciye veya "Bağlantıyı test et"e yazın. Router portlarını açmayın.', 'یہ ایڈریس ناظر میں یا "کنکشن ٹیسٹ" میں لکھیں۔ راؤٹر کے پورٹ نہ کھولیں۔'],
+  'لم يُكتشف Tailscale على هذا الهاتف بعد': ['Tailscale was not detected on this phone yet', 'Tailscale n\'est pas encore détecté sur ce téléphone', 'Bu telefonda henüz Tailscale algılanmadı', 'اس فون پر ابھی Tailscale نہیں ملا'],
+  'افتح الرابط': ['Open the link', 'Ouvrez le lien', 'Bağlantıyı açın', 'لنک کھولیں'],
+  'على أي جهاز على نفس الشبكة افتح الرابط المعروض على هاتف الكاميرا (ينتهي بـ /web).': ['On any device on the same network open the link shown on the camera phone (ends with /web).', 'Sur tout appareil du même réseau, ouvrez le lien affiché sur le téléphone caméra (finit par /web).', 'Aynı ağdaki herhangi bir cihazda kamera telefonunda görünen bağlantıyı açın (/web ile biter).', 'اسی نیٹ ورک کے کسی بھی ڈیوائس پر کیمرہ فون پر دکھایا گیا لنک کھولیں (/web پر ختم)۔'],
+  'اقبل التحذير': ['Accept the warning', 'Acceptez l\'avertissement', 'Uyarıyı kabul edin', 'انتباہ قبول کریں'],
+  'قد يعرض المتصفح تحذير شهادة لأن الاتصال محلي. اختر المتابعة.': ['The browser may show a certificate warning because the link is local. Choose to continue.', 'Le navigateur peut afficher un avertissement de certificat car le lien est local. Choisissez de continuer.', 'Bağlantı yerel olduğu için tarayıcı sertifika uyarısı gösterebilir. Devam edin.', 'لنک مقامی ہونے کی وجہ سے براؤزر سرٹیفکیٹ کی وارننگ دکھا سکتا ہے۔ جاری رکھیں۔'],
+  'اكتب الرمز': ['Enter the code', 'Saisissez le code', 'Kodu yazın', 'کوڈ لکھیں'],
+  'اكتب رمز المشاهدة فقط لتعرض البث بلا تحكم.': ['Enter the view‑only code to watch without control.', 'Saisissez le code lecture seule pour regarder sans contrôle.', 'Kontrolsüz izlemek için yalnızca izleme kodunu yazın.', 'بغیر کنٹرول کے دیکھنے کے لیے صرف دیکھنے کا کوڈ لکھیں۔'],
+  'سجل الدخول': ['Access log', 'Journal d\'accès', 'Erişim günlüğü', 'رسائی لاگ'],
+  'سجل الدخول لصاحب الرمز الأساسي فقط': ['The access log is for the main PIN holder only', 'Le journal est réservé au détenteur du PIN principal', 'Erişim günlüğü yalnızca ana PIN sahibi içindir', 'رسائی لاگ صرف اصل PIN والے کے لیے ہے'],
+  'سجّل الدخول': ['Access log', 'Journal d\'accès', 'Erişim günlüğü', 'رسائی لاگ'],
+  'شاهد': ['Watch', 'Regarder', 'İzle', 'دیکھیں'],
+  'افتح الكاميرا الآن': ['Open the camera now', 'Ouvrir la caméra maintenant', 'Kamerayı şimdi aç', 'ابھی کیمرہ کھولیں'],
+  'أضف كاميرا': ['Add a camera', 'Ajouter une caméra', 'Kamera ekle', 'کیمرہ شامل کریں'],
+  'امسح رمز QR من الكاميرا': ['Scan the QR code from the camera', 'Scannez le code QR de la caméra', 'Kameradaki QR kodunu tarayın', 'کیمرے سے QR کوڈ اسکین کریں'],
+  'حل المشاكل وشرح الاستخدام': ['Fix problems and learn how to use', 'Résoudre les problèmes et mode d\'emploi', 'Sorunları çözün ve kullanımı öğrenin', 'مسائل حل کریں اور استعمال سیکھیں'],
+  'الوضع المتقدم': ['Advanced mode', 'Mode avancé', 'Gelişmiş mod', 'ایڈوانسڈ موڈ'],
+  'لا توجد كاميرا محفوظة — أضف واحدة أولاً': ['No saved camera — add one first', 'Aucune caméra enregistrée — ajoutez-en une', 'Kayıtlı kamera yok — önce bir tane ekleyin', 'کوئی محفوظ کیمرہ نہیں — پہلے ایک شامل کریں'],
+  'الواجهة وإمكانية الوصول': ['Interface & accessibility', 'Interface et accessibilité', 'Arayüz ve erişilebilirlik', 'انٹرفیس اور رسائی'],
+  'واجهة مبسّطة (3 أزرار)': ['Simple interface (3 buttons)', 'Interface simple (3 boutons)', 'Basit arayüz (3 düğme)', 'آسان انٹرفیس (3 بٹن)'],
+  'اللغة': ['Language', 'Langue', 'Dil', 'زبان'],
+  'حجم الخط': ['Text size', 'Taille du texte', 'Yazı boyutu', 'ٹیکسٹ سائز'],
+  'عادي': ['Normal', 'Normal', 'Normal', 'عام'],
+  'كبير': ['Large', 'Grand', 'Büyük', 'بڑا'],
+  'كبير جداً': ['Extra large', 'Très grand', 'Çok büyük', 'بہت بڑا'],
+  'تباين عالٍ': ['High contrast', 'Contraste élevé', 'Yüksek kontrast', 'زیادہ کنٹراسٹ'],
+  'قراءة التنبيهات بصوت عالٍ': ['Read alerts aloud', 'Lire les alertes à voix haute', 'Uyarıları sesli oku', 'الرٹس بلند آواز میں پڑھیں'],
+  'قفل التطبيق': ['App lock', 'Verrouillage de l\'app', 'Uygulama kilidi', 'ایپ لاک'],
+  'قفل التطبيق (بصمة / وجه / رمز)': ['App lock (fingerprint / face / code)', 'Verrouillage (empreinte / visage / code)', 'Uygulama kilidi (parmak izi / yüz / kod)', 'ایپ لاک (فنگر پرنٹ / چہرہ / کوڈ)'],
+  'تعيين رمز القفل': ['Set the lock code', 'Définir le code de verrouillage', 'Kilit kodunu belirle', 'لاک کوڈ مقرر کریں'],
+  'رمز من 4 إلى 6 أرقام': ['A code of 4 to 6 digits', 'Un code de 4 à 6 chiffres', '4 ila 6 haneli kod', '4 سے 6 ہندسوں کا کوڈ'],
+  'أتمتة (اختصارات iOS)': ['Automation (iOS Shortcuts)', 'Automatisation (Raccourcis iOS)', 'Otomasyon (iOS Kestirmeler)', 'آٹومیشن (iOS شارٹ کٹس)'],
+  'تفعيل رابط الأتمتة (المنفذ 8082، غير مشفّر)': ['Enable the automation link (port 8082, unencrypted)', 'Activer le lien d\'automatisation (port 8082, non chiffré)', 'Otomasyon bağlantısını etkinleştir (port 8082, şifresiz)', 'آٹومیشن لنک فعال کریں (پورٹ 8082، غیر خفیہ)'],
+  'أنا في المنزل (إيقاف الكشف)': ['I\'m at home (pause detection)', 'Je suis à la maison (pause détection)', 'Evdeyim (algılamayı duraklat)', 'میں گھر پر ہوں (شناخت روکیں)'],
+  'ساعتان': ['2 hours', '2 heures', '2 saat', '2 گھنٹے'],
+  '8 ساعات': ['8 hours', '8 heures', '8 saat', '8 گھنٹے'],
+  'حتى أوقفه': ['Until I turn it off', 'Jusqu\'à désactivation', 'Ben kapatana kadar', 'جب تک بند نہ کروں'],
+  'رعاية كبار السن: تنبيه إن لم تُرصد حركة': ['Elder care: alert if no movement', 'Seniors : alerte sans mouvement', 'Yaşlı bakımı: hareket yoksa uyar', 'بزرگوں کی دیکھ بھال: حرکت نہ ہو تو الرٹ'],
+  '2 س': ['2 h', '2 h', '2 sa', '2 گھنٹے'],
+  '4 س': ['4 h', '4 h', '4 sa', '4 گھنٹے'],
+  '8 س': ['8 h', '8 h', '8 sa', '8 گھنٹے'],
+  '12 س': ['12 h', '12 h', '12 sa', '12 گھنٹے'],
+  'تُسجَّل كل مشاهدة مع التاريخ والجهاز': ['Every viewing is logged with date and device', 'Chaque visionnage est enregistré avec date et appareil', 'Her izleme tarih ve cihazla kaydedilir', 'ہر مشاہدہ تاریخ اور ڈیوائس کے ساتھ درج ہوتا ہے'],
+  'لا توجد حركة منذ فترة طويلة — تحقق من الشخص': ['No movement for a long time — check on the person', 'Aucun mouvement depuis longtemps — vérifiez la personne', 'Uzun süredir hareket yok — kişiyi kontrol edin', 'کافی دیر سے کوئی حرکت نہیں — فرد کو دیکھیں'],
+  'حيوان أليف': ['Pet', 'Animal de compagnie', 'Evcil hayvan', 'پالتو جانور'],
+  'مشاركة': ['Share', 'Partager', 'Paylaş', 'شیئر کریں'],
+  'عنوان Tailscale': ['Tailscale address', 'Adresse Tailscale', 'Tailscale adresi', 'Tailscale ایڈریس'],
+};
+
+bool homeSel(int home, int v) {
+  if (v == 0) return home == 0;
+  if (v == -1) return home == -1;
+  return home > 0 && (v == 2 ? home <= 2 : home > 2);
+}
+
+Future<void> shareBytes(Uint8List b, String name) async {
+  try {
+    final dir = await getTemporaryDirectory();
+    final f = File('${dir.path}/$name');
+    await f.writeAsBytes(b);
+    await Share.shareXFiles([XFile(f.path)]);
+  } catch (_) {}
 }

@@ -823,7 +823,8 @@ jobs:
             <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>\
             <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>\
             <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>\
-            <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>' \
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>\
+          <queries><intent><action android:name="android.intent.action.TTS_SERVICE"/></intent></queries>' \
             android/app/src/main/AndroidManifest.xml
 
       - name: Add background camera service (Android)
@@ -2864,6 +2865,7 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string Microphone is used for streaming" $P
           /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string Used to connect to the camera on your local network" $P
           /usr/libexec/PlistBuddy -c "Add :NSPhotoLibraryAddUsageDescription string Used to save snapshots from the camera" $P
+          /usr/libexec/PlistBuddy -c "Add :NSFaceIDUsageDescription string Used to unlock the app" $P
           /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" $P
           /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" $P
 

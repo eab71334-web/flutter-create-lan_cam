@@ -18,6 +18,10 @@ dependencies:
   battery_plus: ^6.2.0
   gal: ^2.3.0
   quick_actions: ^1.0.7
+  flutter_tts: ^4.2.0
+  local_auth: ^2.3.0
+  share_plus: ^10.1.4
+  url_launcher: ^6.3.1
 
 flutter:
   uses-material-design: true

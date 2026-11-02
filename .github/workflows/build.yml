@@ -1885,6 +1885,33 @@ jobs:
           EOF
           echo "android.suppressUnsupportedCompileSdk=36" >> android/gradle.properties
 
+      - name: Ensure dependencies and files
+        shell: bash
+        run: |
+          for p in qr_flutter:^4.1.0 mobile_scanner:^6.0.2 battery_plus:^6.2.0 gal:^2.3.0 quick_actions:^1.0.7 flutter_tts:^4.2.0 local_auth:^2.3.0 share_plus:^10.1.4 url_launcher:^6.3.1; do
+            n=${p%%:*}
+            if ! grep -q "^  $n:" pubspec.yaml; then
+              echo "adding $n"
+              flutter pub add "$p"
+            fi
+          done
+          python3 - << 'PY'
+          import re
+          s = open('pubspec.yaml').read()
+          if 'assets/tls/cert.pem' not in s:
+              if re.search(r'^  assets:', s, re.M):
+                  s = re.sub(r'^  assets:\n', '  assets:\n    - assets/tls/cert.pem\n    - assets/tls/key.pem\n', s, count=1, flags=re.M)
+              else:
+                  s = s.replace('  uses-material-design: true\n', '  uses-material-design: true\n  assets:\n    - assets/tls/cert.pem\n    - assets/tls/key.pem\n')
+              open('pubspec.yaml', 'w').write(s)
+              print('assets added')
+          PY
+          mkdir -p lib
+          if [ ! -f lib/person.dart ]; then
+            printf "import 'dart:typed_data';\n\nconst bool kPersonSupported = false;\n\nFuture<bool> detectPerson(Uint8List png) async => false;\n" > lib/person.dart
+            echo "person.dart stub created"
+          fi
+
       - name: Add TLS identity (encrypted signalling)
         run: |
           mkdir -p assets/tls
@@ -2873,6 +2900,33 @@ jobs:
         run: |
           sed -i '' -E "s/^#? ?platform :ios, '[0-9.]+'/platform :ios, '15.5'/" ios/Podfile
           sed -i '' -E "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = 15.5;/g" ios/Runner.xcodeproj/project.pbxproj
+
+      - name: Ensure dependencies and files
+        shell: bash
+        run: |
+          for p in qr_flutter:^4.1.0 mobile_scanner:^6.0.2 battery_plus:^6.2.0 gal:^2.3.0 quick_actions:^1.0.7 flutter_tts:^4.2.0 local_auth:^2.3.0 share_plus:^10.1.4 url_launcher:^6.3.1; do
+            n=${p%%:*}
+            if ! grep -q "^  $n:" pubspec.yaml; then
+              echo "adding $n"
+              flutter pub add "$p"
+            fi
+          done
+          python3 - << 'PY'
+          import re
+          s = open('pubspec.yaml').read()
+          if 'assets/tls/cert.pem' not in s:
+              if re.search(r'^  assets:', s, re.M):
+                  s = re.sub(r'^  assets:\n', '  assets:\n    - assets/tls/cert.pem\n    - assets/tls/key.pem\n', s, count=1, flags=re.M)
+              else:
+                  s = s.replace('  uses-material-design: true\n', '  uses-material-design: true\n  assets:\n    - assets/tls/cert.pem\n    - assets/tls/key.pem\n')
+              open('pubspec.yaml', 'w').write(s)
+              print('assets added')
+          PY
+          mkdir -p lib
+          if [ ! -f lib/person.dart ]; then
+            printf "import 'dart:typed_data';\n\nconst bool kPersonSupported = false;\n\nFuture<bool> detectPerson(Uint8List png) async => false;\n" > lib/person.dart
+            echo "person.dart stub created"
+          fi
 
       - name: Add TLS identity (encrypted signalling)
         run: |

@@ -710,6 +710,7 @@ class _DiagPageState extends State<DiagPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => introOnce(context, 'diag'));
     loadSettings().then((s) {
       if (mounted) _ipCtl.text = '${s['ip'] ?? ''}';
     });
@@ -1333,6 +1334,12 @@ class QrScanPage extends StatefulWidget {
 class _QrScanPageState extends State<QrScanPage> {
   final _c = MobileScannerController(formats: const [BarcodeFormat.qrCode]);
   bool _done = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => introOnce(context, 'qrscan'));
+  }
 
   void _onDetect(BarcodeCapture cap) {
     if (_done) return;
@@ -1977,7 +1984,13 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
                           MaterialPageRoute(builder: (_) => const SettingsPage())),
                     ),
                     const SizedBox(height: 12),
-                    Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Wrap(alignment: WrapAlignment.center, children: [
+                      TextButton.icon(
+                        icon: const Icon(Icons.menu_book_rounded, size: 18),
+                        label: const Text('كتيب التعليمات'),
+                        onPressed: () => Navigator.push(context,
+                            MaterialPageRoute(builder: (_) => const ManualPage())),
+                      ),
                       TextButton.icon(
                         icon: const Icon(Icons.health_and_safety_rounded, size: 18),
                         label: const Text('لماذا لا يعمل؟'),
@@ -2047,6 +2060,7 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => introOnce(context, 'settings'));
     loadSettings().then((m) {
       if (mounted) setState(() => _s = m);
     });
@@ -2056,6 +2070,8 @@ class _SettingsPageState extends State<SettingsPage> {
     setState(() => _s[k] = v);
     saveSettings({k: v});
     applyUiPrefs(_s);
+    final iid = kSetIntro[k];
+    if (iid != null && v != false) introOnce(context, iid);
   }
 
   Widget _field(String label, String key,
@@ -2122,9 +2138,18 @@ class _SettingsPageState extends State<SettingsPage> {
           Row(children: [
             Icon(icon, color: kAccent, size: 20),
             const SizedBox(width: 8),
-            Text(title,
-                style:
-                    const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+            Expanded(
+              child: Text(title,
+                  style: const TextStyle(
+                      fontSize: 16, fontWeight: FontWeight.w700)),
+            ),
+            if (kGroupIntro.containsKey(title))
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.help_outline_rounded,
+                    size: 20, color: Colors.white54),
+                onPressed: () => showIntro(context, kGroupIntro[title]!),
+              ),
           ]),
           const SizedBox(height: 14),
           ...children,
@@ -2301,6 +2326,15 @@ class _SettingsPageState extends State<SettingsPage> {
                 'autoBackup', false, [false, true], ['إيقاف', 'تشغيل']),
           ]),
           _group('مساعدة', Icons.help_outline_rounded, [
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.menu_book_rounded),
+              title: const Text('كتيب التعليمات'),
+              onTap: () => Navigator.push(context,
+                  MaterialPageRoute(builder: (_) => const ManualPage())),
+            ),
+            _chips<bool>('تلميحات عند أول استخدام لكل ميزة', 'introOn', true,
+                [true, false], ['نعم', 'لا']),
             ListTile(
               contentPadding: EdgeInsets.zero,
               leading: const Icon(Icons.rocket_launch_rounded),
@@ -2568,6 +2602,8 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     CameraPage.active = true;
+    WidgetsBinding.instance
+        .addPostFrameCallback((_) => introOnce(context, 'camera'));
     WidgetsBinding.instance.addObserver(this);
     WakelockPlus.enable(); // keep the screen on while broadcasting
     _start();
@@ -3909,6 +3945,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   }
 
   void _showQr() {
+    introOnce(context, 'qrshow');
     final cands = _ips.isEmpty ? [MapEntry('wifi', _ip)] : _ips;
     var sel = cands.indexWhere((e) => e.value == _ip);
     if (sel < 0) sel = 0;
@@ -4458,7 +4495,10 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
                 subtitle: const Text('الإعدادات الكاملة من جهاز المشاهدة (زر الأمان)',
                     style: TextStyle(fontSize: 11, color: Colors.white54)),
                 value: _mOn,
-                onChanged: (v) => _applyCfg({'on': v}),
+                onChanged: (v) {
+                  if (v) introOnce(context, 'motion');
+                  _applyCfg({'on': v});
+                },
               ),
             ),
             Container(
@@ -4476,7 +4516,10 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
                 subtitle: const Text('شاشة سوداء إذا لم يشاهد أحد لمدة دقيقة',
                     style: TextStyle(fontSize: 11, color: Colors.white54)),
                 value: _idleDim,
-                onChanged: (v) => _applyCfg({'idle': v}),
+                onChanged: (v) {
+                  if (v) introOnce(context, 'idle');
+                  _applyCfg({'idle': v});
+                },
               ),
             ),
             if (Platform.isAndroid)
@@ -4495,7 +4538,10 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
                   subtitle: const Text('اتصل في أي وقت حتى لو التطبيق مغلق',
                       style: TextStyle(fontSize: 11, color: Colors.white54)),
                   value: _always,
-                  onChanged: _toggleAlways,
+                  onChanged: (v) {
+                    if (v) introOnce(context, 'always');
+                    _toggleAlways(v);
+                  },
                 ),
               ),
             if (Platform.isAndroid && _always)
@@ -4514,7 +4560,10 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
                   subtitle: const Text('وصّل الشاحن فتبدأ الكاميرا تلقائياً',
                       style: TextStyle(fontSize: 11, color: Colors.white54)),
                   value: _chargeStart,
-                  onChanged: _toggleChargeStart,
+                  onChanged: (v) {
+                    if (v) introOnce(context, 'charge');
+                    _toggleChargeStart(v);
+                  },
                 ),
               ),
             if (Platform.isAndroid && _always) _diagBox(),
@@ -4761,6 +4810,8 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
             DateTime.now().add(Duration(milliseconds: _camOffsetMs)));
     _statsTimer =
         Timer.periodic(const Duration(seconds: 3), (_) => _pollStats());
+    WidgetsBinding.instance.addPostFrameCallback(
+        (_) => introOnce(context, widget.screen ? 'screen' : 'viewer'));
     loadSettings().then((s) {
       if (!mounted) return;
       _ipCtl.text = widget.initialIp ?? (s['ip'] as String?) ?? '';
@@ -5509,6 +5560,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
       });
 
   void _security() {
+    introOnce(context, 'security');
     showModalBottomSheet(
       context: context,
       backgroundColor: kSurface,
@@ -5518,6 +5570,14 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
           void cfg(Map<String, dynamic> p) {
             _cfgSend(p);
             setM(() {});
+            if (p.length <= 2) {
+              for (final e in p.entries) {
+                final id = kCfgIntro[e.key];
+                if (id != null && e.value != false && e.value != 0) {
+                  introOnce(context, id);
+                }
+              }
+            }
           }
 
           final sens = ((_cfg['sens'] as num?) ?? 1).toInt();
@@ -5692,8 +5752,10 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
                           style: TextStyle(fontSize: 11, color: Colors.white54)),
                       trailing: Wrap(children: [
                         TextButton(
-                            onPressed: () => _send(
-                                {'type': 'cmd', 'cmd': 'siren', 'on': true}),
+                            onPressed: () {
+                              introOnce(context, 'siren');
+                              _send({'type': 'cmd', 'cmd': 'siren', 'on': true});
+                            },
                             child: const Text('تشغيل')),
                         TextButton(
                             onPressed: () => _send(
@@ -5712,6 +5774,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
                               : 'الوضع: تجاهل المناطق المرسومة',
                           style: const TextStyle(fontSize: 11, color: Colors.white54)),
                       onTap: () {
+                        introOnce(context, 'zones');
                         final m = '${_cfg['zmask'] ?? ''}';
                         setState(() {
                           _zEdit = List<bool>.generate(
@@ -5781,6 +5844,7 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
   }
 
   void _eventsSheet() {
+    introOnce(context, 'events');
     setState(() => _unread = 0);
     showModalBottomSheet(
       context: context,
@@ -6344,13 +6408,19 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
             icon: Icons.photo_camera_rounded,
             label: 'لقطة',
             dark: dark,
-            onTap: _shot),
+            onTap: () {
+                introOnce(context, 'shot');
+                _shot();
+              }),
         CtlButton(
             icon: Icons.nightlight_round,
             label: 'ليلي',
             active: _night > 0,
             dark: dark,
-            onTap: _tools),
+            onTap: () {
+                introOnce(context, 'night');
+                _tools();
+              }),
         CtlButton(
             icon: Icons.video_library_rounded,
             label: 'التسجيلات',
@@ -6379,7 +6449,10 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
               label: 'ميكروفون',
               active: _talking,
               dark: dark,
-              onTap: _toggleMic),
+              onTap: () {
+                introOnce(context, 'mic');
+                _toggleMic();
+              }),
           CtlButton(
               icon: _muted ? Icons.volume_off : Icons.volume_up,
               label: 'الصوت',
@@ -6391,29 +6464,44 @@ class _ViewerPageState extends State<ViewerPage> with WidgetsBindingObserver {
               label: _remoteRec ? 'إيقاف' : 'تسجيل',
               active: _remoteRec,
               dark: dark,
-              onTap: _toggleRec),
+              onTap: () {
+                introOnce(context, 'rec');
+                _toggleRec();
+              }),
           CtlButton(
               icon: Icons.photo_camera_rounded,
               label: 'لقطة',
               dark: dark,
-              onTap: _shot),
+              onTap: () {
+                introOnce(context, 'shot');
+                _shot();
+              }),
           CtlButton(
               icon: Icons.cameraswitch,
               label: 'قلب',
               dark: dark,
-              onTap: _switchCam),
+              onTap: () {
+                introOnce(context, 'flip');
+                _switchCam();
+              }),
           CtlButton(
               icon: _torch ? Icons.flashlight_on : Icons.flashlight_off,
               label: 'فلاش',
               active: _torch,
               dark: dark,
-              onTap: _toggleTorch),
+              onTap: () {
+                introOnce(context, 'torch');
+                _toggleTorch();
+              }),
           CtlButton(
               icon: Icons.nightlight_round,
               label: 'ليلي',
               active: _night > 0,
               dark: dark,
-              onTap: _tools),
+              onTap: () {
+                introOnce(context, 'night');
+                _tools();
+              }),
           CtlButton(
               icon: Icons.video_library_rounded,
               label: 'التسجيلات',
@@ -6724,6 +6812,7 @@ class _MultiViewPageState extends State<MultiViewPage> {
   void initState() {
     super.initState();
     WakelockPlus.enable();
+    WidgetsBinding.instance.addPostFrameCallback((_) => introOnce(context, 'multi'));
     loadSettings().then((s) {
       final l = s['cams'];
       if (l is List && mounted) {
@@ -7411,6 +7500,7 @@ class _LibraryPageState extends State<LibraryPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => introOnce(context, 'library'));
     _load();
   }
 
@@ -7846,6 +7936,8 @@ class _TimelapsePageState extends State<TimelapsePage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance
+        .addPostFrameCallback((_) => introOnce(context, 'timelapseview'));
     _load();
   }
 
@@ -8386,6 +8478,17 @@ class HelpHubPage extends StatelessWidget {
           ListTile(
             tileColor: kSurface,
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            leading: const Icon(Icons.menu_book_rounded, color: kAccent),
+            title: const Text('كتيب التعليمات'),
+            subtitle: const Text('شرح كل ميزة خطوة بخطوة، مع بحث',
+                style: TextStyle(fontSize: 12, color: Colors.white54)),
+            onTap: () => Navigator.push(context,
+                MaterialPageRoute(builder: (_) => const ManualPage())),
+          ),
+          const SizedBox(height: 10),
+          ListTile(
+            tileColor: kSurface,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
             leading: const Icon(Icons.health_and_safety_rounded, color: kAccent),
             title: const Text('لماذا لا يعمل؟'),
             subtitle: const Text('فحص سريع مع أزرار إصلاح',
@@ -8618,6 +8721,7 @@ class _AccessLogPageState extends State<AccessLogPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => introOnce(context, 'accesslog'));
     _load();
   }
 
@@ -8793,6 +8897,18 @@ async function start(){
 </script></body></html>''';
 
 const Map<String, List<String>> kTr = {
+  'كتيب التعليمات': ['Instruction booklet', 'Manuel d\'utilisation', 'Kullanım kılavuzu', 'ہدایات کی کتاب'],
+  'فهمت': ['Got it', 'Compris', 'Anladım', 'سمجھ گیا'],
+  'لا تعرض التلميحات': ['Don\'t show hints', 'Ne plus afficher les astuces', 'İpuçlarını gösterme', 'تجاویز نہ دکھائیں'],
+  'بحث في الكتيب': ['Search the booklet', 'Rechercher dans le manuel', 'Kılavuzda ara', 'کتاب میں تلاش کریں'],
+  'إعادة عرض التلميحات من البداية': ['Show all hints again', 'Réafficher toutes les astuces', 'İpuçlarını yeniden göster', 'تمام تجاویز دوبارہ دکھائیں'],
+  'تم إعادة ضبط التلميحات': ['Hints were reset', 'Astuces réinitialisées', 'İpuçları sıfırlandı', 'تجاویز ری سیٹ ہو گئیں'],
+  'تلميحات عند أول استخدام لكل ميزة': ['Hints the first time each feature is used', 'Astuces à la première utilisation', 'Her özellik ilk kullanıldığında ipucu', 'ہر فیچر کے پہلے استعمال پر تجاویز'],
+  'بدء الاستخدام': ['Getting started', 'Premiers pas', 'Başlarken', 'شروعات'],
+  'الأمان والكشف': ['Security & detection', 'Sécurité et détection', 'Güvenlik ve algılama', 'سیکیورٹی اور شناخت'],
+  'التسجيلات والنسخ': ['Recordings & backup', 'Enregistrements et sauvegarde', 'Kayıt ve yedekleme', 'ریکارڈنگز اور بیک اپ'],
+  'الإعدادات': ['Settings', 'Réglages', 'Ayarlar', 'سیٹنگز'],
+  'المساعدة': ['Help', 'Aide', 'Yardım', 'مدد'],
   'الشبكة المحلية (واي فاي)': ['Local network (Wi‑Fi)', 'Réseau local (Wi‑Fi)', 'Yerel ağ (Wi‑Fi)', 'مقامی نیٹ ورک (وائی فائی)'],
   'غير متصل بشبكة. اتصل بالواي فاي نفسه على الهاتفين.': ['Not connected. Join the same Wi‑Fi on both phones.', 'Non connecté. Rejoignez le même Wi‑Fi sur les deux téléphones.', 'Bağlı değil. İki telefonda da aynı Wi‑Fi\'a bağlanın.', 'نیٹ ورک سے منسلک نہیں۔ دونوں فونز پر ایک ہی وائی فائی سے جڑیں۔'],
   'إذن الكاميرا': ['Camera permission', 'Autorisation de la caméra', 'Kamera izni', 'کیمرے کی اجازت'],
@@ -9195,4 +9311,523 @@ Future<void> shareBytes(Uint8List b, String name) async {
     await f.writeAsBytes(b);
     await Share.shareXFiles([XFile(f.path)]);
   } catch (_) {}
+}
+
+// ───────────────── Instruction booklet + first-use hints ─────────────────
+class _Intro {
+  const _Intro(this.cat, this.icon, this.title, this.steps);
+  final String cat;
+  final IconData icon;
+  final String title;
+  final List<String> steps;
+}
+
+const List<String> kManualCats = [
+  'بدء الاستخدام',
+  'الكاميرا',
+  'المشاهدة',
+  'الأمان والكشف',
+  'التسجيلات والنسخ',
+  'الإشعارات',
+  'الإعدادات',
+  'المساعدة',
+];
+
+const Map<String, _Intro> kIntros = {
+  // ── start ──
+  'start': _Intro('بدء الاستخدام', Icons.rocket_launch_rounded, 'البدء السريع', [
+    'على هاتف الكاميرا: افتح "وضع الكاميرا" ثم "عرض رمز QR للربط".',
+    'على هاتف المشاهدة: افتح "وضع المشاهدة" أو "أضف كاميرا" وامسح الرمز.',
+    'عند أي مشكلة افتح "ساعدني" ثم "لماذا لا يعمل؟".',
+  ]),
+  'simple': _Intro('بدء الاستخدام', Icons.looks_3_rounded, 'واجهة مبسّطة', [
+    'تعرض 3 أزرار كبيرة فقط: شاهد، أضف كاميرا، ساعدني.',
+    '"شاهد" يفتح كاميرتك مباشرة، أو شبكة الكاميرات إن كان لديك أكثر من واحدة.',
+    'للعودة إلى كل الخيارات اضغط "الوضع المتقدم" أسفل الشاشة.',
+  ]),
+  'lang': _Intro('بدء الاستخدام', Icons.translate_rounded, 'اللغة', [
+    'اختر اللغة من الإعدادات ← الواجهة وإمكانية الوصول.',
+    '"تلقائي" يتبع لغة الهاتف.',
+    'بعض النصوص الطويلة تبقى بالعربية.',
+  ]),
+  'a11y': _Intro('بدء الاستخدام', Icons.accessibility_new_rounded, 'إمكانية الوصول', [
+    'حجم الخط: عادي أو كبير أو كبير جداً.',
+    'التباين العالي يجعل النصوص والأزرار أوضح.',
+    'قراءة التنبيهات بصوت عالٍ تنطق تنبيهات الحركة والبطارية على جهاز المشاهدة.',
+  ]),
+  // ── camera ──
+  'camera': _Intro('الكاميرا', Icons.videocam_rounded, 'وضع الكاميرا', [
+    'ثبّت الهاتف في مكانه وصِله بالشاحن.',
+    'من جهاز المشاهدة اكتب الـ IP والـ PIN، أو اعرض رمز QR ليمسحه.',
+    'فعّل "جاهزية دائمة" لتبقى الكاميرا قابلة للاتصال حتى لو أُغلق التطبيق.',
+  ]),
+  'always': _Intro('الكاميرا', Icons.power_settings_new_rounded, 'جاهزية دائمة', [
+    'تُبقي الكاميرا قابلة للإيقاظ حتى لو أغلقت التطبيق.',
+    'اسمح باستثناء البطارية والظهور فوق التطبيقات عند الطلب.',
+    'المشاهد يوقظ الكاميرا تلقائياً عند الاتصال.',
+  ]),
+  'charge': _Intro('الكاميرا', Icons.battery_charging_full_rounded, 'بدء الكاميرا عند الشحن', [
+    'يتطلب تفعيل "جاهزية دائمة" أولاً.',
+    'عند توصيل الشاحن تبدأ الكاميرا بالبث تلقائياً.',
+  ]),
+  'idle': _Intro('الكاميرا', Icons.bedtime_rounded, 'توفير الطاقة', [
+    'بعد دقيقة بلا مشاهد وبلا تسجيل تصبح الشاشة سوداء.',
+    'المس الشاشة لإعادتها. تعود تلقائياً عند اتصال مشاهد.',
+  ]),
+  'qrshow': _Intro('الكاميرا', Icons.qr_code_2_rounded, 'ربط سريع عبر QR', [
+    'اختر "تحكم كامل" أو "مشاهدة فقط" حسب من سيمسح الرمز.',
+    'على الجهاز الآخر اضغط QR وامسح الرمز؛ يتصل بلا كتابة IP أو PIN.',
+    'الرمز يحتوي الـ PIN فلا تعرضه لمن لا تثق به.',
+  ]),
+  'motion': _Intro('الكاميرا', Icons.directions_run_rounded, 'كشف الحركة', [
+    'فعّله هنا أو من زر "الأمان" في المشاهد، حيث الإعدادات الكاملة.',
+    'عند الحركة تصلك لقطة وتنبيه.',
+    'اترك الكاميرا موصولة بالشاحن لأن الكشف يزيد استهلاك البطارية.',
+  ]),
+  // ── viewer ──
+  'viewer': _Intro('المشاهدة', Icons.visibility_rounded, 'وضع المشاهدة', [
+    'اضغط "بحث" أو "QR" لإيجاد الكاميرا، واكتب الـ PIN إن لزم.',
+    'اضغط "اتصال". زر "عريض" يعرض الشاشة الكاملة.',
+    'اقرص الصورة للتكبير، ونقرتان لإعادتها.',
+  ]),
+  'multi': _Intro('المشاهدة', Icons.grid_view_rounded, 'عدة كاميرات', [
+    'أضف حتى 4 كاميرات بزر +.',
+    'اضغط أي كاميرا لفتحها كاملة.',
+    'ضغطة مطولة: تعديل الاسم واللون أو تغيير الترتيب.',
+  ]),
+  'screen': _Intro('المشاهدة', Icons.phone_android_rounded, 'شاشة الهاتف', [
+    'على هاتف Android اضغط "بدء مشاركة الشاشة" ووافق.',
+    'للتحكم فعّل إمكانية الوصول (اختياري).',
+    'اضغط النقاط في زاوية الشاشة لإظهار الأزرار، وتختفي بعد 4 ثوانٍ.',
+  ]),
+  'qrscan': _Intro('المشاهدة', Icons.qr_code_scanner_rounded, 'مسح رمز QR', [
+    'على جهاز الكاميرا اضغط "عرض رمز QR للربط".',
+    'وجّه كاميرا هذا الهاتف نحو الرمز.',
+  ]),
+  'mic': _Intro('المشاهدة', Icons.mic_rounded, 'الميكروفون (تحدّث للكاميرا)', [
+    'اضغط الميكروفون ثم تحدّث؛ يسمعك من عند الكاميرا.',
+    'اضغطه مرة أخرى لإيقاف الإرسال.',
+  ]),
+  'rec': _Intro('المشاهدة', Icons.fiber_manual_record_rounded, 'تسجيل من المشاهد', [
+    'يبدأ التسجيل على جهاز الكاميرا (Android).',
+    'تجد الملفات في "التسجيلات" وتنزّلها إلى الصور.',
+  ]),
+  'shot': _Intro('المشاهدة', Icons.photo_camera_rounded, 'لقطة', [
+    'تحفظ صورة من البث الحالي في ألبوم الصور.',
+    'اسمح بالوصول للصور عند الطلب.',
+  ]),
+  'flip': _Intro('المشاهدة', Icons.cameraswitch_rounded, 'قلب الكاميرا', [
+    'يبدّل بين العدسة الخلفية والأمامية في جهاز الكاميرا.',
+  ]),
+  'torch': _Intro('المشاهدة', Icons.flashlight_on_rounded, 'الفلاش', [
+    'يشغّل مصباح هاتف الكاميرا لإضاءة المكان.',
+    'يعمل مع العدسة الخلفية.',
+  ]),
+  'night': _Intro('المشاهدة', Icons.nightlight_round, 'رؤية ليلية', [
+    'اختر "ليلي" أو "ليلي قوي" لتفتيح الصورة المظلمة.',
+    'هو تحسين للعرض على المشاهد فقط ولا يغيّر إعدادات الكاميرا.',
+    'من هنا أيضاً: ختم الوقت والمدى البعيد وإعادة الزوم.',
+  ]),
+  // ── security ──
+  'security': _Intro('الأمان والكشف', Icons.security_rounded, 'الأمان والمراقبة الذكية', [
+    'ابدأ بملف جاهز (منزل، غرفة طفل، حيوان أليف، متجر) ثم عدّل ما تريد.',
+    'كل خيار تفعّله لأول مرة يعرض لك شرحاً مختصراً.',
+    'تُحفظ الإعدادات على جهاز الكاميرا.',
+  ]),
+  'sens': _Intro('الأمان والكشف', Icons.tune_rounded, 'الحساسية', [
+    'منخفضة: حركات كبيرة فقط. عالية: تلتقط أصغر حركة.',
+    'إن كثرت الإنذارات الكاذبة خفّضها أو فعّل التصفية.',
+  ]),
+  'filter': _Intro('الأمان والكشف', Icons.filter_alt_rounded, 'تصفية الإنذارات الكاذبة', [
+    'يتجاهل الحركة الصغيرة (حشرات) وتغيّر الإضاءة والوميض.',
+    'ليس تعرّفاً على الأشخاص.',
+  ]),
+  'autorec': _Intro('الأمان والكشف', Icons.video_camera_back_rounded, 'تسجيل تلقائي عند الحركة', [
+    'يبدأ التسجيل عند الحركة ويتوقف بعد 15 ثانية من آخرها (Android).',
+    'فعّل "تسجيل دوّار" حتى لا يمتلئ التخزين.',
+  ]),
+  'preroll': _Intro('الأمان والكشف', Icons.history_toggle_off_rounded, 'تسجيل ما قبل الحركة', [
+    'يحتفظ بحتى 10 ثوانٍ قبل الحركة.',
+    'يسجّل باستمرار فيزيد البطارية والكتابة على التخزين.',
+    'يتطلب التسجيل التلقائي.',
+  ]),
+  'person': _Intro('الأمان والكشف', Icons.person_search_rounded, 'اعتماد الأشخاص فقط', [
+    'تُعتمد الحركة فقط إذا ظهر وجه أو جسم شخص.',
+    'يتوفر في بناء Android الذي فُعّل فيه خيار ml.',
+  ]),
+  'sound': _Intro('الأمان والكشف', Icons.hearing_rounded, 'كشف الصوت', [
+    'يتكيّف مع مستوى الهدوء المعتاد ويُنبّه عند صوت أعلى بكثير.',
+    'قد لا تعطي بعض الأجهزة مستوى الميكروفون فتظهر "غير مدعوم".',
+    'يظهر شريط مستوى الصوت على الفيديو أثناء المشاهدة.',
+  ]),
+  'schedule': _Intro('الأمان والكشف', Icons.schedule_rounded, 'جدول زمني', [
+    'اختر ساعة البداية والنهاية؛ الحركة والصوت يعملان فيها فقط.',
+    'يدعم الفترات التي تعبر منتصف الليل.',
+  ]),
+  'loop': _Intro('الأمان والكشف', Icons.autorenew_rounded, 'تسجيل دوّار', [
+    'اختر حجماً (1 إلى 10 GB).',
+    'عند تجاوزه تُحذف أقدم التسجيلات تلقائياً.',
+  ]),
+  'timelapse': _Intro('الأمان والكشف', Icons.slow_motion_video_rounded, 'تصوير زمني', [
+    'لقطة صغيرة كل 1 إلى 10 دقائق تُحفظ على الكاميرا.',
+    'تشاهدها كعرض متحرك من "التسجيلات".',
+  ]),
+  'homemode': _Intro('الأمان والكشف', Icons.home_rounded, 'أنا في المنزل', [
+    'يوقف الكشف لساعتين أو 8 ساعات أو حتى توقفه أنت.',
+    'للأتمتة بآيفون: الإعدادات ← أتمتة (اختصارات iOS).',
+  ]),
+  'care': _Intro('الأمان والكشف', Icons.elderly_rounded, 'رعاية كبار السن', [
+    'يُنبّهك إن لم تُرصد حركة لعدد الساعات المحدد.',
+    'يتطلب تفعيل كشف الحركة.',
+    'لا يكتشف السقوط.',
+  ]),
+  'siren': _Intro('الأمان والكشف', Icons.campaign_rounded, 'صفارة على الكاميرا', [
+    'تشغّل نغمة تنبيه واهتزازاً على جهاز الكاميرا لمدة 15 ثانية.',
+    'مفيدة لتنبيه من حول الكاميرا.',
+  ]),
+  'zones': _Intro('الأمان والكشف', Icons.grid_on_rounded, 'مناطق الكشف', [
+    'مرّر إصبعك على الخانات لتلوينها أو إزالتها.',
+    'اختر "تجاهل المناطق" أو "مراقبة المناطق فقط".',
+    'اضغط "تم" لحفظها.',
+  ]),
+  'accesslog': _Intro('الأمان والكشف', Icons.history_rounded, 'سجل الدخول', [
+    'يعرض من شاهد الكاميرا ومتى وبأي صلاحية.',
+    'دخول جهاز جديد لأول مرة يرسل إشعاراً.',
+  ]),
+  // ── recordings ──
+  'library': _Intro('التسجيلات والنسخ', Icons.video_library_rounded, 'مكتبة التسجيلات والأحداث', [
+    'تعرض تسجيلات الكاميرا ولقطات الأحداث مرتبة بالأيام.',
+    'زر التنزيل يحفظ التسجيل في الصور، وزر المشاركة يرسله لتطبيق آخر.',
+    'الحذف متاح لصاحب الرمز الكامل فقط.',
+  ]),
+  'events': _Intro('التسجيلات والنسخ', Icons.notifications_active_rounded, 'الأحداث', [
+    'تصلك لقطة عند كل حركة أو صوت أثناء المشاهدة.',
+    'اضغط الحدث لرؤية اللحظة وبعدها بثلاث ثوانٍ.',
+  ]),
+  'timelapseview': _Intro('التسجيلات والنسخ', Icons.play_circle_fill_rounded, 'عرض التصوير الزمني', [
+    'اضغط تشغيل/إيقاف، واختر السرعة.',
+    'اسحب الشريط للتنقل بين اللقطات.',
+  ]),
+  'backup': _Intro('التسجيلات والنسخ', Icons.cloud_upload_rounded, 'نسخ احتياطي', [
+    'WebDAV: كل تسجيل ينتهي يُرفع تلقائياً من هاتف الكاميرا.',
+    'النسخ إلى الصور على آيفون يتم عند الاتصال بالكاميرا.',
+  ]),
+  // ── notifications ──
+  'push': _Intro('الإشعارات', Icons.send_rounded, 'إشعارات خارجية', [
+    'تيليغرام: أنشئ بوتاً من @BotFather وضع الرمز، ثم أرسل رسالة للبوت واضغط "جلب Chat ID".',
+    'ntfy: ثبّت تطبيق ntfy واشترك بنفس اسم الموضوع.',
+    'اضغط "إرسال اختبار" للتأكد. يلزم إنترنت على هاتف الكاميرا.',
+  ]),
+  'alerts': _Intro('الإشعارات', Icons.notifications_rounded, 'التنبيهات على المشاهد', [
+    'حدّد مستوى البطارية والحرارة التي تُنبّهك.',
+    'اختر الصوت والاهتزاز وأقل فاصل بين التنبيهات.',
+  ]),
+  'daily': _Intro('الإشعارات', Icons.summarize_rounded, 'ملخص يومي', [
+    'اختر ساعة تصلك فيها رسالة بعدد أحداث اليوم وأكثر ساعة نشاطاً.',
+    'يتطلب ضبط الإشعارات الخارجية.',
+  ]),
+  // ── settings ──
+  'settings': _Intro('الإعدادات', Icons.tune_rounded, 'إعدادات البث', [
+    'كل تغيير يُحفظ تلقائياً.',
+    'علامة ؟ بجانب كل قسم تشرح خياراته.',
+    'إعادة الضبط في قسم "متقدم".',
+  ]),
+  'stream': _Intro('الإعدادات', Icons.videocam_rounded, 'البث', [
+    'الدقة والإطارات ومعدل البيانات تؤثر على الوضوح واستهلاك الشبكة.',
+    'إن كانت الإشارة ضعيفة اخفض الدقة.',
+  ]),
+  'range': _Intro('الإعدادات', Icons.wifi_tethering_rounded, 'المدى والشبكة', [
+    'وضع المدى البعيد يخفض الجودة ليبقى الاتصال ثابتاً.',
+    'استخدم واي فاي 2.4GHz للمسافات الأبعد.',
+  ]),
+  'wan': _Intro('الإعدادات', Icons.public_rounded, 'الاتصال من خارج الشبكة', [
+    'يفيد عند المشاهدة عبر الإنترنت.',
+    'الأفضل استخدام Tailscale ولا تفتح منافذ الراوتر.',
+  ]),
+  'viewing': _Intro('الإعدادات', Icons.visibility_rounded, 'خيارات المشاهدة', [
+    'إعادة الاتصال التلقائية تعيد الاتصال عند الانقطاع.',
+    'يمكنك كتم الصوت عند الاتصال وإبقاء الشاشة مضاءة.',
+  ]),
+  'applock': _Intro('الإعدادات', Icons.lock_rounded, 'قفل التطبيق', [
+    'على آيفون: بصمة أو وجه. وعلى غيره: رمز من 4 إلى 6 أرقام.',
+    'يُقفل عند العودة للتطبيق بعد 30 ثانية.',
+    'إن نسيت الرمز احذف التطبيق وثبّته من جديد.',
+  ]),
+  'sec_settings': _Intro('الإعدادات', Icons.shield_rounded, 'أمان الاتصال', [
+    'عدد المحاولات الخاطئة لـ PIN قبل القفل ومدة القفل.',
+    'يمكن تغيير الـ PIN تلقائياً عند كل تشغيل للكاميرا.',
+  ]),
+  'shortcuts': _Intro('الإعدادات', Icons.bolt_rounded, 'أتمتة (اختصارات iOS)', [
+    'فعّل الرابط ثم أنشئ في "اختصارات" أتمتة عند الاتصال بشبكة الواي فاي.',
+    'الإجراء: الحصول على محتويات URL وفق الصيغة المكتوبة في الإعدادات.',
+    'الرابط غير مشفّر، فاستخدمه على شبكة بيتك فقط.',
+  ]),
+  'advanced': _Intro('الإعدادات', Icons.build_rounded, 'متقدم', [
+    'نسخ معلومات التشخيص لإرسالها عند طلب المساعدة (بدون PIN).',
+    'إعادة ضبط كل الإعدادات تحذف الكاميرات المحفوظة.',
+  ]),
+  // ── help ──
+  'diag': _Intro('المساعدة', Icons.health_and_safety_rounded, 'لماذا لا يعمل؟', [
+    '✓ يعني يعمل و ✗ يعني مشكلة، واضغط الزر بجانب ✗ لإصلاحها.',
+    'لاختبار كاميرا بعيدة اكتب عنوانها واضغط "فحص".',
+  ]),
+};
+
+/// Setting key -> hint shown the first time it is changed.
+const Map<String, String> kSetIntro = {
+  'simple': 'simple',
+  'lang': 'lang',
+  'fontScale': 'a11y',
+  'contrast': 'a11y',
+  'speak': 'a11y',
+  'appLock': 'applock',
+  'appLockPin': 'applock',
+  'autoSrv': 'shortcuts',
+  'wan': 'wan',
+  'range': 'range',
+  'autoBackup': 'backup',
+  'dailyHour': 'daily',
+  'alertBat': 'alerts',
+  'alertTemp': 'alerts',
+  'lockTries': 'sec_settings',
+  'pinRotate': 'sec_settings',
+};
+
+/// Security-sheet option -> hint shown the first time it is turned on.
+const Map<String, String> kCfgIntro = {
+  'on': 'motion',
+  'son': 'sound',
+  'sched': 'schedule',
+  'pre': 'preroll',
+  'person': 'person',
+  'filter': 'filter',
+  'rec': 'autorec',
+  'loop': 'loop',
+  'tl': 'timelapse',
+  'home': 'homemode',
+  'care': 'care',
+  'sens': 'sens',
+};
+
+/// Settings section title -> hint opened by its "?" button.
+const Map<String, String> kGroupIntro = {
+  'البث (جهاز الكاميرا)': 'stream',
+  'المدى والشبكة': 'range',
+  'الواجهة وإمكانية الوصول': 'a11y',
+  'قفل التطبيق': 'applock',
+  'أتمتة (اختصارات iOS)': 'shortcuts',
+  'إشعارات خارجية (والتطبيق مغلق)': 'push',
+  'نسخ احتياطي': 'backup',
+  'التنبيهات (جهاز المشاهدة)': 'alerts',
+  'المشاهدة': 'viewing',
+  'الأمان': 'sec_settings',
+  'متقدم': 'advanced',
+};
+
+final Set<String> _introSession = {};
+
+/// Shows the how-to for [id] once (first time the feature is used).
+Future<void> introOnce(BuildContext context, String id) async {
+  if (!kIntros.containsKey(id) || _introSession.contains(id)) return;
+  _introSession.add(id);
+  final s = await loadSettings();
+  if (s['introOn'] == false) return;
+  final seen = <String>{
+    for (final e in ((s['introSeen'] as List?) ?? const [])) '$e',
+  };
+  if (seen.contains(id)) return;
+  seen.add(id);
+  await saveSettings({'introSeen': seen.toList()});
+  if (!context.mounted) return;
+  await showIntro(context, id, first: true);
+}
+
+Future<void> showIntro(BuildContext context, String id,
+    {bool first = false}) async {
+  final it = kIntros[id];
+  if (it == null) return;
+  await showDialog<void>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: kSurface,
+      title: Row(children: [
+        Container(
+          width: 40,
+          height: 40,
+          decoration: const BoxDecoration(
+              color: Color(0x2622D3EE), shape: BoxShape.circle),
+          child: Icon(it.icon, color: kAccent),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(it.title,
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+        ),
+      ]),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            for (var i = 0; i < it.steps.length; i++)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Container(
+                    width: 22,
+                    height: 22,
+                    alignment: Alignment.center,
+                    decoration: const BoxDecoration(
+                        color: kAccent, shape: BoxShape.circle),
+                    child: Text('${i + 1}',
+                        style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w800,
+                            color: Color(0xFF04202A))),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(it.steps[i],
+                        style: const TextStyle(fontSize: 14, height: 1.6)),
+                  ),
+                ]),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        if (first)
+          TextButton(
+            onPressed: () {
+              saveSettings({'introOn': false});
+              Navigator.pop(ctx);
+            },
+            child: const Text('لا تعرض التلميحات'),
+          ),
+        TextButton(
+          onPressed: () {
+            Navigator.pop(ctx);
+            Navigator.push(context,
+                MaterialPageRoute(builder: (_) => ManualPage(focus: id)));
+          },
+          child: const Text('كتيب التعليمات'),
+        ),
+        FilledButton(
+            onPressed: () => Navigator.pop(ctx), child: const Text('فهمت')),
+      ],
+    ),
+  );
+}
+
+class ManualPage extends StatefulWidget {
+  const ManualPage({super.key, this.focus});
+  final String? focus;
+  @override
+  State<ManualPage> createState() => _ManualPageState();
+}
+
+class _ManualPageState extends State<ManualPage> {
+  final _keys = <String, GlobalKey>{};
+  String _q = '';
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.focus != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final c = _keys[widget.focus]?.currentContext;
+        if (c != null) {
+          Scrollable.ensureVisible(c,
+              duration: const Duration(milliseconds: 300));
+        }
+      });
+    }
+  }
+
+  bool _match(_Intro it) {
+    if (_q.isEmpty) return true;
+    if (it.title.contains(_q) || tr(it.title).toLowerCase().contains(_q.toLowerCase())) {
+      return true;
+    }
+    return it.steps.any((s) => s.contains(_q));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = <Widget>[];
+    for (final cat in kManualCats) {
+      final items = [
+        for (final e in kIntros.entries)
+          if (e.value.cat == cat && _match(e.value)) e,
+      ];
+      if (items.isEmpty) continue;
+      rows.add(Padding(
+        padding: const EdgeInsets.fromLTRB(4, 16, 4, 6),
+        child: Text(cat,
+            style: const TextStyle(
+                fontWeight: FontWeight.w800, color: Colors.white70)),
+      ));
+      for (final e in items) {
+        rows.add(Container(
+          margin: const EdgeInsets.only(bottom: 8),
+          decoration: BoxDecoration(
+            color: kSurface,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Theme(
+            data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+            child: ExpansionTile(
+              key: _keys.putIfAbsent(e.key, () => GlobalKey()),
+              initiallyExpanded: e.key == widget.focus,
+              leading: Icon(e.value.icon, color: kAccent),
+              title: Text(e.value.title,
+                  style: const TextStyle(fontWeight: FontWeight.w700)),
+              childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+              expandedCrossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (var i = 0; i < e.value.steps.length; i++)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Text('${i + 1}. ${e.value.steps[i]}',
+                        style: const TextStyle(
+                            fontSize: 13, color: Colors.white70, height: 1.6)),
+                  ),
+              ],
+            ),
+          ),
+        ));
+      }
+    }
+    return Scaffold(
+      appBar: AppBar(title: const Text('كتيب التعليمات')),
+      body: ListView(padding: const EdgeInsets.fromLTRB(14, 8, 14, 24), children: [
+        TextField(
+          onChanged: (v) => setState(() => _q = v.trim()),
+          decoration: InputDecoration(
+            prefixIcon: const Icon(Icons.search_rounded),
+            hintText: 'بحث في الكتيب',
+            filled: true,
+            fillColor: kSurface,
+            border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(14),
+                borderSide: BorderSide.none),
+          ),
+        ),
+        ...rows,
+        const SizedBox(height: 16),
+        OutlinedButton.icon(
+          icon: const Icon(Icons.restart_alt_rounded),
+          label: const Text('إعادة عرض التلميحات من البداية'),
+          onPressed: () async {
+            await saveSettings({'introSeen': <String>[], 'introOn': true});
+            _introSession.clear();
+            if (context.mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('تم إعادة ضبط التلميحات')));
+            }
+          },
+        ),
+      ]),
+    );
+  }
 }
